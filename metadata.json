@@ -1,0 +1,7 @@
+{
+  "name": "SEO Outreach Intelligence Engine",
+  "description": "Automated SEO lead research and personalized outreach generation.",
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
