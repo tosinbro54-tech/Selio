@@ -11,9 +11,59 @@ const generateUUID = () => {
   });
 };
 
+// The inverse of CLIENT_OWNED_ANALYSIS_FIELDS — these are the columns only
+// server-side sends/cron ever write. Safe to merge into local state at any
+// time since the client never owns them; no risk of clobbering user edits.
+export const SERVER_OWNED_DB_TO_CLIENT_FIELD: Record<string, string> = {
+  sent_status: 'sentStatus',
+  sent_at: 'sentAt',
+  sent_to: 'sentTo',
+  last_email_sent_at: 'lastEmailSentAt',
+  follow_up1_sent: 'followUp1Sent',
+  follow_up1_sent_at: 'followUp1SentAt',
+  follow_up2_sent: 'followUp2Sent',
+  follow_up2_sent_at: 'followUp2SentAt',
+  follow_up3_sent: 'followUp3Sent',
+  follow_up3_sent_at: 'followUp3SentAt',
+  batch_status: 'batchStatus',
+  error_reason: 'errorReason',
+  initial_message_id: 'initialMessageId',
+  initial_thread_id: 'initialThreadId',
+  status: 'status',
+};
+
 // ============================================================
 // CAMPAIGNS
 // ============================================================
+
+export const mapCampaignFromDb = (row: any) => {
+  if (!row) return null;
+  return {
+    id: row.id,
+    userId: row.user_id,
+    name: row.name,
+    country: row.country,
+    timezone: row.timezone,
+    industry: row.industry,
+    decisionMakerTitle: row.decision_maker_title,
+    icpContext: row.icp_context,
+    senderAccountId: row.sender_account_id,
+    followUpStartTime: row.follow_up_start_time,
+    followUpEndTime: row.follow_up_end_time,
+    followUp1Days: row.follow_up1_days,
+    followUp2Days: row.follow_up2_days,
+    followUp3Days: row.follow_up3_days,
+    scheduleStartTime: row.schedule_start_time,
+    scheduleEndTime: row.schedule_end_time,
+    dailyLimit: row.daily_limit,
+    leadCount: row.lead_count,
+    analyzedCount: row.analyzed_count,
+    sentCount: row.sent_count,
+    replyCount: row.reply_count,
+    createdAt: row.created_at,
+    lastOpened: row.last_opened,
+  };
+};
 
 export const getCampaigns = async (userId: string) => {
   const { data, error } = await supabase
@@ -22,35 +72,38 @@ export const getCampaigns = async (userId: string) => {
     .eq('user_id', userId)
     .order('last_opened', { ascending: false });
   if (error) { console.error('[DB] getCampaigns error:', error); return []; }
-  return data || [];
+  return (data || []).map(mapCampaignFromDb);
 };
 
-export const saveCampaign = async (campaign: any, userId: string) => {
+export const saveCampaign = async (campaign: any, userId: string, touchLastOpened = false) => {
+  const payload: any = {
+    id: campaign.id,
+    user_id: userId,
+    name: campaign.name,
+    country: campaign.country,
+    timezone: campaign.timezone || null,
+    industry: campaign.industry,
+    decision_maker_title: campaign.decisionMakerTitle !== undefined ? campaign.decisionMakerTitle : campaign.decision_maker_title,
+    icp_context: campaign.icpContext !== undefined ? campaign.icpContext : campaign.icp_context,
+    sender_account_id: campaign.senderAccountId !== undefined ? campaign.senderAccountId : campaign.sender_account_id,
+    follow_up_start_time: campaign.followUpStartTime !== undefined ? campaign.followUpStartTime : campaign.follow_up_start_time,
+    follow_up_end_time: campaign.followUpEndTime !== undefined ? campaign.followUpEndTime : campaign.follow_up_end_time,
+    follow_up1_days: campaign.followUp1Days !== undefined ? campaign.followUp1Days : (campaign.follow_up1_days || 3),
+    follow_up2_days: campaign.followUp2Days !== undefined ? campaign.followUp2Days : (campaign.follow_up2_days || 10),
+    follow_up3_days: campaign.followUp3Days !== undefined ? campaign.followUp3Days : (campaign.follow_up3_days || 17),
+    schedule_start_time: campaign.scheduleStartTime !== undefined ? campaign.scheduleStartTime : (campaign.schedule_start_time || '09:00'),
+    schedule_end_time: campaign.scheduleEndTime !== undefined ? campaign.scheduleEndTime : (campaign.schedule_end_time || '11:00'),
+    daily_limit: campaign.dailyLimit !== undefined ? campaign.dailyLimit : (campaign.daily_limit || 50),
+    lead_count: campaign.leadCount !== undefined ? campaign.leadCount : (campaign.lead_count || 0),
+    analyzed_count: campaign.analyzedCount !== undefined ? campaign.analyzedCount : (campaign.analyzed_count || 0),
+    sent_count: campaign.sentCount !== undefined ? campaign.sentCount : (campaign.sent_count || 0),
+    reply_count: campaign.replyCount !== undefined ? campaign.replyCount : (campaign.reply_count || 0),
+  };
+  if (touchLastOpened) payload.last_opened = new Date().toISOString();
+
   const { data, error } = await supabase
     .from('campaigns')
-    .upsert({
-      id: campaign.id,
-      user_id: userId,
-      name: campaign.name,
-      country: campaign.country,
-      industry: campaign.industry,
-      decision_maker_title: campaign.decisionMakerTitle,
-      icp_context: campaign.icpContext,
-      sender_account_id: campaign.senderAccountId,
-      follow_up_start_time: campaign.followUpStartTime,
-      follow_up_end_time: campaign.followUpEndTime,
-      follow_up1_days: campaign.followUp1Days || 3,
-      follow_up2_days: campaign.followUp2Days || 10,
-      follow_up3_days: campaign.followUp3Days || 17,
-      schedule_start_time: campaign.scheduleStartTime || '09:00',
-      schedule_end_time: campaign.scheduleEndTime || '11:00',
-      daily_limit: campaign.dailyLimit || 50,
-      lead_count: campaign.leadCount || 0,
-      analyzed_count: campaign.analyzedCount || 0,
-      sent_count: campaign.sentCount || 0,
-      reply_count: campaign.replyCount || 0,
-      last_opened: new Date().toISOString(),
-    }, { onConflict: 'id' });
+    .upsert(payload, { onConflict: 'id' });
   if (error) console.error('[DB] saveCampaign error:', error);
   return data;
 };
@@ -107,26 +160,7 @@ export const getLeads = async (campaignId: string) => {
 };
 
 export const saveLeads = async (campaignId: string, userId: string, leads: any[]) => {
-  if (!leads.length) {
-    const { error } = await supabase.from('leads').delete().eq('campaign_id', campaignId);
-    if (error) console.error('[DB] saveLeads delete all error:', error);
-    return [];
-  }
-
-  // Fetch existing lead IDs from DB to remove any database records that were deleted from the UI list
-  const { data: dbLeads, error: fetchError } = await supabase
-    .from('leads')
-    .select('id')
-    .eq('campaign_id', campaignId);
-
-  if (!fetchError && dbLeads) {
-    const currentDbIds = dbLeads.map(l => l.id);
-    const incomingIds = new Set(leads.map(l => l._supabaseId).filter(Boolean));
-    const idsToDelete = currentDbIds.filter(id => !incomingIds.has(id));
-    if (idsToDelete.length > 0) {
-      await supabase.from('leads').delete().in('id', idsToDelete);
-    }
-  }
+  if (!leads.length) return [];
 
   const rows = leads.map(lead => ({
     campaign_id: campaignId,
@@ -165,6 +199,36 @@ export const saveLeads = async (campaignId: string, userId: string, leads: any[]
   }));
 };
 
+export const reconcileLeadDeletions = async (campaignId: string, authoritativeLeads: any[]) => {
+  if (!authoritativeLeads.length) {
+    // Explicit empty-list case (e.g. "clear all leads") — still gate this
+    // behind an explicit caller, not a stray state update.
+    const { error } = await supabase.from('leads').delete().eq('campaign_id', campaignId);
+    if (error) console.error('[DB] reconcileLeadDeletions (clear all) error:', error);
+    return;
+  }
+
+  const { data: dbLeads, error: fetchError } = await supabase
+    .from('leads')
+    .select('id')
+    .eq('campaign_id', campaignId);
+
+  if (fetchError || !dbLeads) {
+    console.error('[DB] reconcileLeadDeletions: failed to fetch current leads:', fetchError);
+    return;
+  }
+
+  const currentDbIds = dbLeads.map(l => l.id);
+  const incomingIds = new Set(authoritativeLeads.map(l => l._supabaseId).filter(Boolean));
+  const idsToDelete = currentDbIds.filter(id => !incomingIds.has(id));
+
+  if (idsToDelete.length > 0) {
+    console.log(`[DB] reconcileLeadDeletions: removing ${idsToDelete.length} leads no longer in the imported list`);
+    const { error } = await supabase.from('leads').delete().in('id', idsToDelete);
+    if (error) console.error('[DB] reconcileLeadDeletions delete error:', error);
+  }
+};
+
 export const deleteCampaignLeads = async (campaignId: string) => {
   const { error } = await supabase
     .from('leads')
@@ -200,7 +264,12 @@ export const getAnalysis = async (campaignId: string) => {
     .eq('campaign_id', campaignId);
 
   if (leadsError) {
-    console.error('[DB] getAnalysis (fetching leads) error:', leadsError);
+    console.error('[DB] getAnalysis (fetching leads) error:', {
+      message: leadsError.message,
+      code: leadsError.code,
+      details: leadsError.details,
+      hint: leadsError.hint
+    });
     return {};
   }
 
@@ -217,7 +286,15 @@ export const getAnalysis = async (campaignId: string) => {
     .select('*')
     .eq('campaign_id', campaignId);
 
-  if (error) { console.error('[DB] getAnalysis error:', error); return {}; }
+  if (error) {
+    console.error('[DB] getAnalysis error:', {
+      message: error.message,
+      code: error.code,
+      details: error.details,
+      hint: error.hint
+    });
+    return {};
+  }
 
   const result: Record<number, any> = {};
   for (const row of (data || [])) {
@@ -285,10 +362,10 @@ export const getAnalysis = async (campaignId: string) => {
       viableStatus: row.viable_status,
       disqualifyReason: row.disqualify_reason,
       aiAnalysis: row.ai_analysis,
-      initialEmail: row.initial_email,
-      followUp1: row.follow_up1,
-      followUp2: row.follow_up2,
-      followUp3: row.follow_up3,
+      initialEmail: row.initial_email || row.ai_analysis?.initialEmail || null,
+      followUp1: row.follow_up1 || row.ai_analysis?.followUp1 || null,
+      followUp2: row.follow_up2 || row.ai_analysis?.followUp2 || null,
+      followUp3: row.follow_up3 || row.ai_analysis?.followUp3 || null,
       subjectLines: row.subject_lines,
       insights: row.insights,
       primaryProblem: row.primary_problem,
@@ -332,10 +409,7 @@ export const saveAnalysis = async (
       .eq('campaign_id', campaignId)
       .eq('row_index', rowIndex)
       .maybeSingle();
-
-    if (dbLead) {
-      finalLeadId = dbLead.id;
-    }
+    if (dbLead) finalLeadId = dbLead.id;
   }
 
   if (!finalLeadId) {
@@ -343,7 +417,6 @@ export const saveAnalysis = async (
     return;
   }
 
-  // Fetch any existing lead_analysis row to get its ID for primary key upsert
   const { data: existing } = await supabase
     .from('lead_analysis')
     .select('id')
@@ -351,73 +424,111 @@ export const saveAnalysis = async (
     .maybeSingle();
 
   const existingId = existing?.id;
+  const clientFields = buildClientOwnedRow(analysis); // reuse the allowlist helper added for saveBulkAnalysis
 
-  const { error } = await supabase
-    .from('lead_analysis')
-    .upsert({
-      id: existingId || generateUUID(),
+  const dbRow: any = {
+    crawl_layer_label: clientFields.crawlLayerLabel,
+    has_https: clientFields.hasHttps,
+    has_blog: clientFields.hasBlog,
+    blog_abandoned: clientFields.blogAbandoned,
+    last_post_date: clientFields.lastPostDate,
+    word_count_estimate: clientFields.wordCountEstimate,
+    has_open_graph: clientFields.hasOpenGraph,
+    has_schema: clientFields.hasSchema,
+    has_search_console: clientFields.hasSearchConsole,
+    h1_count: clientFields.h1Count,
+    h1_text: clientFields.h1Text,
+    h2_count: clientFields.h2Count,
+    images_missing_alt: clientFields.imagesMissingAlt,
+    total_images: clientFields.totalImages,
+    has_canonical: clientFields.hasCanonical,
+    description: clientFields.description,
+    description_length: clientFields.descriptionLength,
+    title: clientFields.title,
+    title_length: clientFields.titleLength,
+    internal_links: clientFields.internalLinks,
+    psi_scores: clientFields.psiScores,
+    ranked_problems: clientFields.rankedProblems,
+    opportunity_score: clientFields.score !== undefined ? clientFields.score : clientFields.opportunityScore,
+    total_score: clientFields.totalScore !== undefined ? clientFields.totalScore : clientFields.score,
+    classification: clientFields.classification,
+    viable: clientFields.viable,
+    viable_status: clientFields.viableStatus,
+    disqualify_reason: clientFields.disqualifyReason,
+    ai_analysis: clientFields.aiAnalysis,
+    initial_email: clientFields.initialEmail,
+    follow_up1: clientFields.followUp1,
+    follow_up2: clientFields.followUp2,
+    follow_up3: clientFields.followUp3,
+    subject_lines: clientFields.subjectLines,
+    insights: clientFields.insights,
+    primary_problem: clientFields.primaryProblem,
+    outreach_angle: clientFields.outreachAngle,
+    spam_reported: clientFields.spamReported,
+    unsubscribed_at: clientFields.unsubscribedAt,
+    bounced_at: clientFields.bouncedAt,
+    updated_at: new Date().toISOString(),
+  };
+  Object.keys(dbRow).forEach(k => dbRow[k] === undefined && delete dbRow[k]);
+
+  if (existingId) {
+    const { error } = await supabase.from('lead_analysis').update(dbRow).eq('id', existingId);
+    if (error) console.error('[DB] saveAnalysis error:', JSON.stringify(error, null, 2) || error);
+  } else {
+    const { error } = await supabase.from('lead_analysis').insert({
+      id: generateUUID(),
       lead_id: finalLeadId,
       campaign_id: campaignId,
       user_id: userId,
-      viable: analysis.viable,
-      crawl_layer_label: analysis.crawlLayerLabel || analysis.seoData?.crawlLayerLabel,
-      has_https: analysis.hasHttps !== undefined ? analysis.hasHttps : analysis.seoData?.hasHttps,
-      has_blog: analysis.hasBlog !== undefined ? analysis.hasBlog : analysis.seoData?.hasBlog,
-      blog_abandoned: analysis.blogAbandoned !== undefined ? analysis.blogAbandoned : analysis.seoData?.blogAbandoned,
-      last_post_date: analysis.lastPostDate || analysis.seoData?.lastPostDate,
-      word_count_estimate: analysis.wordCountEstimate !== undefined ? analysis.wordCountEstimate : analysis.seoData?.wordCountEstimate,
-      has_open_graph: analysis.hasOpenGraph !== undefined ? analysis.hasOpenGraph : analysis.seoData?.hasOpenGraph,
-      has_schema: analysis.hasSchema !== undefined ? analysis.hasSchema : analysis.seoData?.hasSchema,
-      has_search_console: analysis.hasSearchConsole !== undefined ? analysis.hasSearchConsole : analysis.seoData?.hasSearchConsole,
-      h1_count: analysis.h1Count !== undefined ? analysis.h1Count : analysis.seoData?.h1Count,
-      h1_text: analysis.h1Text || analysis.seoData?.h1Text,
-      h2_count: analysis.h2Count !== undefined ? analysis.h2Count : analysis.seoData?.h2Count,
-      images_missing_alt: analysis.imagesMissingAlt !== undefined ? analysis.imagesMissingAlt : analysis.seoData?.imagesMissingAlt,
-      total_images: analysis.totalImages !== undefined ? analysis.totalImages : analysis.seoData?.totalImages,
-      has_canonical: analysis.hasCanonical !== undefined ? analysis.hasCanonical : analysis.seoData?.hasCanonical,
-      description: analysis.description || analysis.seoData?.description,
-      description_length: analysis.descriptionLength !== undefined ? analysis.descriptionLength : analysis.seoData?.descriptionLength,
-      title: analysis.title || analysis.seoData?.title,
-      title_length: analysis.titleLength !== undefined ? analysis.titleLength : analysis.seoData?.titleLength,
-      internal_links: analysis.internalLinks || analysis.seoData?.internalLinks,
-      psi_scores: analysis.psiScores || analysis.seoData?.psiScores,
-      ranked_problems: analysis.rankedProblems || analysis.seoData?.rankedProblems,
-      opportunity_score: analysis.score !== undefined ? analysis.score : (analysis.opportunityScore !== undefined ? analysis.opportunityScore : (analysis.details?.opportunityScore || 0)),
-      total_score: analysis.totalScore !== undefined ? analysis.totalScore : (analysis.score || 0),
-      classification: analysis.classification,
-      status: analysis.status,
-      viable_status: analysis.viableStatus,
-      disqualify_reason: analysis.disqualifyReason,
-      ai_analysis: analysis.aiAnalysis,
-      initial_email: analysis.initialEmail,
-      follow_up1: analysis.followUp1,
-      follow_up2: analysis.followUp2,
-      follow_up3: analysis.followUp3,
-      subject_lines: analysis.subjectLines,
-      insights: analysis.insights,
-      primary_problem: analysis.primaryProblem,
-      outreach_angle: analysis.outreachAngle,
-      sent_status: analysis.sentStatus || 'not-sent',
-      sent_at: analysis.sentAt,
-      sent_to: analysis.sentTo,
-      last_email_sent_at: analysis.lastEmailSentAt,
-      follow_up1_sent: analysis.followUp1Sent || false,
-      follow_up1_sent_at: analysis.followUp1SentAt,
-      follow_up2_sent: analysis.followUp2Sent || false,
-      follow_up2_sent_at: analysis.followUp2SentAt,
-      follow_up3_sent: analysis.followUp3Sent || false,
-      follow_up3_sent_at: analysis.followUp3SentAt,
-      batch_status: analysis.batchStatus || 'queued',
-      error_reason: analysis.errorReason,
-      spam_reported: analysis.spamReported || false,
-      unsubscribed_at: analysis.unsubscribedAt,
-      bounced_at: analysis.bouncedAt,
-      initial_message_id: analysis.initialMessageId,
-      initial_thread_id: analysis.initialThreadId,
-      updated_at: new Date().toISOString(),
-    }, { onConflict: 'id' });
-  if (error) console.error('[DB] saveAnalysis error:', JSON.stringify(error, null, 2) || error);
+      sent_status: 'not-sent',
+      batch_status: null,
+      ...dbRow,
+    });
+    if (error) console.error('[DB] saveAnalysis error:', JSON.stringify(error, null, 2) || error);
+  }
 };
+
+// Fields the client is authoritative for — analysis results, edited copy, etc.
+// Everything NOT in this list is owned by the server (cron/send routes) and
+// must never be overwritten by a client-side bulk save, or an open tab with
+// stale local state can silently undo a real send in progress.
+const CLIENT_OWNED_ANALYSIS_FIELDS = new Set([
+  'viable', 'crawlLayerLabel', 'hasHttps', 'hasBlog', 'blogAbandoned', 'lastPostDate',
+  'wordCountEstimate', 'hasOpenGraph', 'hasSchema', 'hasSearchConsole', 'h1Count', 'h1Text',
+  'h2Count', 'imagesMissingAlt', 'totalImages', 'hasCanonical', 'description', 'descriptionLength',
+  'title', 'titleLength', 'internalLinks', 'psiScores', 'rankedProblems',
+  'opportunityScore', 'totalScore', 'score', 'classification', 'viableStatus', 'disqualifyReason',
+  'aiAnalysis', 'initialEmail', 'followUp1', 'followUp2', 'followUp3', 'subjectLines',
+  'insights', 'primaryProblem', 'outreachAngle',
+  // spam/bounce toggles are legitimately user-driven (manual flag buttons), keep client-owned
+  'spamReported', 'unsubscribedAt', 'bouncedAt',
+]);
+
+// Server-owned: sent_status, sentAt, sentTo, lastEmailSentAt, followUp1/2/3Sent + SentAt,
+// batchStatus, errorReason, initialMessageId, initialThreadId, status
+// These are set only by /api/send-email, send-batch-now, and the cron functions.
+
+function buildClientOwnedRow(analysis: any) {
+  const row: any = {};
+  for (const key of CLIENT_OWNED_ANALYSIS_FIELDS) {
+    let val = analysis[key];
+    if (val === undefined && analysis.seoData) {
+      val = analysis.seoData[key];
+    }
+    row[key] = val;
+  }
+  // extra fallback for opportunity score
+  if (row.opportunityScore === undefined && analysis.details?.opportunityScore !== undefined) {
+    row.opportunityScore = analysis.details.opportunityScore;
+  }
+  // extra fallback for score
+  if (row.score === undefined && analysis.score !== undefined) {
+    row.score = analysis.score;
+  }
+  return row;
+}
+
+let saveBulkAnalysisPromise: Promise<any> = Promise.resolve();
 
 export const saveBulkAnalysis = async (
   campaignId: string,
@@ -425,148 +536,169 @@ export const saveBulkAnalysis = async (
   analyzedLeads: Record<number, any>,
   leads: any[]
 ) => {
-  console.log('[DB] saveBulkAnalysis called with', Object.keys(analyzedLeads).length, 'analyzed leads,', leads.length, 'leads fallback');
-
-  // Let's ALWAYS fetch all current leads for this campaign from Supabase to ensure we have the absolute latest IDs.
-  const { data: dbLeads, error: dbLeadsError } = await supabase
-    .from('leads')
-    .select('id, row_index')
-    .eq('campaign_id', campaignId);
-
-  const dbLeadsMap = new Map<number, string>();
-  if (!dbLeadsError && dbLeads) {
-    for (const r of dbLeads) {
-      if (r.row_index !== undefined && r.row_index !== null) {
-        dbLeadsMap.set(parseInt(r.row_index), r.id);
-      }
-    }
+  const currentPromise = saveBulkAnalysisPromise;
+  
+  let resolveLock: () => void;
+  const newPromise = new Promise<void>(resolve => {
+    resolveLock = resolve;
+  });
+  
+  saveBulkAnalysisPromise = newPromise;
+  
+  try {
+    await currentPromise;
+  } catch (e) {
+    // ignore previous execution errors
   }
 
-  // Also fallback to any in-memory leads if they contain _supabaseId and aren't in dbLeadsMap yet
-  for (const l of (leads || [])) {
-    if (l._supabaseId && l.rowIndex !== undefined && !dbLeadsMap.has(l.rowIndex)) {
-      dbLeadsMap.set(l.rowIndex, l._supabaseId);
-    }
-  }
+  try {
+    console.log('[DB] saveBulkAnalysis called with', Object.keys(analyzedLeads).length, 'analyzed leads,', leads.length, 'leads fallback');
 
-  // Check if any lead in our in-memory list is missing from the database map
-  const missingAny = (leads || []).some(l => !dbLeadsMap.has(l.rowIndex));
+    // Let's ALWAYS fetch all current leads for this campaign from Supabase to ensure we have the absolute latest IDs.
+    const { data: dbLeads, error: dbLeadsError } = await supabase
+      .from('leads')
+      .select('id, row_index')
+      .eq('campaign_id', campaignId);
 
-  if (missingAny && leads && leads.length > 0) {
-    console.log('[DB] saveBulkAnalysis: Some leads are missing from the database map. Auto-saving leads first to resolve IDs...');
-    try {
-      const savedLeads = await saveLeads(campaignId, userId, leads);
-      // Re-populate the map with fresh saved leads
-      dbLeadsMap.clear();
-      for (const sl of savedLeads) {
-        if (sl._supabaseId && sl.rowIndex !== undefined) {
-          dbLeadsMap.set(sl.rowIndex, sl._supabaseId);
+    const dbLeadsMap = new Map<number, string>();
+    if (!dbLeadsError && dbLeads) {
+      for (const r of dbLeads) {
+        if (r.row_index !== undefined && r.row_index !== null) {
+          dbLeadsMap.set(parseInt(r.row_index), r.id);
         }
       }
-    } catch (err) {
-      console.error('[DB] saveBulkAnalysis: failed to auto-save missing leads:', err);
     }
-  }
 
-  // To avoid ON CONFLICT 'lead_id' errors, fetch existing lead_analysis rows to obtain their ids
-  const { data: existingAnalysisData, error: existingAnalysisError } = await supabase
-    .from('lead_analysis')
-    .select('id, lead_id')
-    .eq('campaign_id', campaignId);
-
-  const existingAnalysisMap = new Map<string, string>();
-  if (!existingAnalysisError && existingAnalysisData) {
-    for (const row of existingAnalysisData) {
-      if (row.lead_id) {
-        existingAnalysisMap.set(row.lead_id, row.id);
+    // Also fallback to any in-memory leads if they contain _supabaseId and aren't in dbLeadsMap yet
+    for (const l of (leads || [])) {
+      if (l._supabaseId && l.rowIndex !== undefined && !dbLeadsMap.has(l.rowIndex)) {
+        dbLeadsMap.set(l.rowIndex, l._supabaseId);
       }
     }
-  }
 
-  const rows = Object.entries(analyzedLeads).map(([rowIndexKey, analysis]) => {
-    const rxInt = parseInt(rowIndexKey);
-    const leadId = dbLeadsMap.get(rxInt);
+    // Check if any lead in our in-memory list is missing from the database map
+    const missingAny = (leads || []).some(l => !dbLeadsMap.has(l.rowIndex));
 
-    if (!leadId) {
-      console.warn(`[DB] saveBulkAnalysis: No lead found with campaign_id ${campaignId} and rowIndex ${rxInt}`);
+    if (missingAny && leads && leads.length > 0) {
+      console.log('[DB] saveBulkAnalysis: Some leads are missing from the database map. Auto-saving leads first to resolve IDs...');
+      try {
+        const savedLeads = await saveLeads(campaignId, userId, leads);
+        // Re-populate the map with fresh saved leads
+        dbLeadsMap.clear();
+        for (const sl of savedLeads) {
+          if (sl._supabaseId && sl.rowIndex !== undefined) {
+            dbLeadsMap.set(sl.rowIndex, sl._supabaseId);
+          }
+        }
+      } catch (err) {
+        console.error('[DB] saveBulkAnalysis: failed to auto-save missing leads:', err);
+      }
     }
 
-    const existingId = leadId ? existingAnalysisMap.get(leadId) : undefined;
+    // To avoid ON CONFLICT 'lead_id' errors, fetch existing lead_analysis rows to obtain their ids
+    const { data: existingAnalysisData, error: existingAnalysisError } = await supabase
+      .from('lead_analysis')
+      .select('id, lead_id')
+      .eq('campaign_id', campaignId);
 
-    return {
-      id: existingId || generateUUID(),
-      lead_id: leadId,
-      campaign_id: campaignId,
-      user_id: userId,
-      viable: analysis.viable,
-      crawl_layer_label: analysis.crawlLayerLabel || analysis.seoData?.crawlLayerLabel,
-      has_https: analysis.hasHttps !== undefined ? analysis.hasHttps : analysis.seoData?.hasHttps,
-      has_blog: analysis.hasBlog !== undefined ? analysis.hasBlog : analysis.seoData?.hasBlog,
-      blog_abandoned: analysis.blogAbandoned !== undefined ? analysis.blogAbandoned : analysis.seoData?.blogAbandoned,
-      last_post_date: analysis.lastPostDate || analysis.seoData?.lastPostDate,
-      word_count_estimate: analysis.wordCountEstimate !== undefined ? analysis.wordCountEstimate : analysis.seoData?.wordCountEstimate,
-      has_open_graph: analysis.hasOpenGraph !== undefined ? analysis.hasOpenGraph : analysis.seoData?.hasOpenGraph,
-      has_schema: analysis.hasSchema !== undefined ? analysis.hasSchema : analysis.seoData?.hasSchema,
-      has_search_console: analysis.hasSearchConsole !== undefined ? analysis.hasSearchConsole : analysis.seoData?.hasSearchConsole,
-      h1_count: analysis.h1Count !== undefined ? analysis.h1Count : analysis.seoData?.h1Count,
-      h1_text: analysis.h1Text || analysis.seoData?.h1Text,
-      h2_count: analysis.h2Count !== undefined ? analysis.h2Count : analysis.seoData?.h2Count,
-      images_missing_alt: analysis.imagesMissingAlt !== undefined ? analysis.imagesMissingAlt : analysis.seoData?.imagesMissingAlt,
-      total_images: analysis.totalImages !== undefined ? analysis.totalImages : analysis.seoData?.totalImages,
-      has_canonical: analysis.hasCanonical !== undefined ? analysis.hasCanonical : analysis.seoData?.hasCanonical,
-      description: analysis.description || analysis.seoData?.description,
-      description_length: analysis.descriptionLength !== undefined ? analysis.descriptionLength : analysis.seoData?.descriptionLength,
-      title: analysis.title || analysis.seoData?.title,
-      title_length: analysis.titleLength !== undefined ? analysis.titleLength : analysis.seoData?.titleLength,
-      internal_links: analysis.internalLinks || analysis.seoData?.internalLinks,
-      psi_scores: analysis.psiScores || analysis.seoData?.psiScores,
-      ranked_problems: analysis.rankedProblems || analysis.seoData?.rankedProblems,
-      opportunity_score: analysis.score !== undefined ? analysis.score : (analysis.opportunityScore !== undefined ? analysis.opportunityScore : (analysis.details?.opportunityScore || 0)),
-      total_score: analysis.totalScore !== undefined ? analysis.totalScore : (analysis.score || 0),
-      classification: analysis.classification,
-      status: analysis.status,
-      viable_status: analysis.viableStatus,
-      disqualify_reason: analysis.disqualifyReason,
-      ai_analysis: analysis.aiAnalysis,
-      initial_email: analysis.initialEmail,
-      follow_up1: analysis.followUp1,
-      follow_up2: analysis.followUp2,
-      follow_up3: analysis.followUp3,
-      subject_lines: analysis.subjectLines,
-      insights: analysis.insights,
-      primary_problem: analysis.primaryProblem,
-      outreach_angle: analysis.outreachAngle,
-      sent_status: analysis.sentStatus || 'not-sent',
-      sent_at: analysis.sentAt,
-      sent_to: analysis.sentTo,
-      last_email_sent_at: analysis.lastEmailSentAt,
-      follow_up1_sent: analysis.followUp1Sent || false,
-      follow_up1_sent_at: analysis.followUp1SentAt,
-      follow_up2_sent: analysis.followUp2Sent || false,
-      follow_up2_sent_at: analysis.followUp2SentAt,
-      follow_up3_sent: analysis.followUp3Sent || false,
-      follow_up3_sent_at: analysis.followUp3SentAt,
-      batch_status: analysis.batchStatus || 'queued',
-      error_reason: analysis.errorReason,
-      spam_reported: analysis.spamReported || false,
-      unsubscribed_at: analysis.unsubscribedAt,
-      bounced_at: analysis.bouncedAt,
-      initial_message_id: analysis.initialMessageId,
-      initial_thread_id: analysis.initialThreadId,
-      updated_at: new Date().toISOString(),
-    };
-  }).filter(row => row.lead_id);
+    const existingAnalysisMap = new Map<string, string>();
+    if (!existingAnalysisError && existingAnalysisData) {
+      for (const row of existingAnalysisData) {
+        if (row.lead_id) {
+          existingAnalysisMap.set(row.lead_id, row.id);
+        }
+      }
+    }
 
-  console.log('[DB] saving', rows.length, 'rows to lead_analysis table in Supabase');
+    // Only rows that already exist get patched (client-owned fields only, via
+    // per-row targeted update). New rows (no existing id) still get a full
+    // insert since there's nothing server-owned to protect yet.
+    const updates: Promise<any>[] = [];
 
-  if (!rows.length) {
-    console.warn('[DB] No valid rows to save (all missing lead_id!). dbLeads count:', dbLeads?.length);
-    return;
+    for (const [rowIndexKey, analysis] of Object.entries(analyzedLeads)) {
+      const rxInt = parseInt(rowIndexKey);
+      const leadId = dbLeadsMap.get(rxInt);
+      if (!leadId) {
+        console.warn(`[DB] saveBulkAnalysis: No lead found for rowIndex ${rxInt}`);
+        continue;
+      }
+
+      const existingId = existingAnalysisMap.get(leadId);
+      const clientFields = buildClientOwnedRow(analysis);
+
+      const dbRow: any = {
+        crawl_layer_label: clientFields.crawlLayerLabel,
+        has_https: clientFields.hasHttps,
+        has_blog: clientFields.hasBlog,
+        blog_abandoned: clientFields.blogAbandoned,
+        last_post_date: clientFields.lastPostDate,
+        word_count_estimate: clientFields.wordCountEstimate,
+        has_open_graph: clientFields.hasOpenGraph,
+        has_schema: clientFields.hasSchema,
+        has_search_console: clientFields.hasSearchConsole,
+        h1_count: clientFields.h1Count,
+        h1_text: clientFields.h1Text,
+        h2_count: clientFields.h2Count,
+        images_missing_alt: clientFields.imagesMissingAlt,
+        total_images: clientFields.totalImages,
+        has_canonical: clientFields.hasCanonical,
+        description: clientFields.description,
+        description_length: clientFields.descriptionLength,
+        title: clientFields.title,
+        title_length: clientFields.titleLength,
+        internal_links: clientFields.internalLinks,
+        psi_scores: clientFields.psiScores,
+        ranked_problems: clientFields.rankedProblems,
+        opportunity_score: clientFields.score !== undefined ? clientFields.score : clientFields.opportunityScore,
+        total_score: clientFields.totalScore !== undefined ? clientFields.totalScore : clientFields.score,
+        classification: clientFields.classification,
+        viable: clientFields.viable,
+        viable_status: clientFields.viableStatus,
+        disqualify_reason: clientFields.disqualifyReason,
+        ai_analysis: clientFields.aiAnalysis,
+        initial_email: clientFields.initialEmail,
+        follow_up1: clientFields.followUp1,
+        follow_up2: clientFields.followUp2,
+        follow_up3: clientFields.followUp3,
+        subject_lines: clientFields.subjectLines,
+        insights: clientFields.insights,
+        primary_problem: clientFields.primaryProblem,
+        outreach_angle: clientFields.outreachAngle,
+        spam_reported: clientFields.spamReported,
+        unsubscribed_at: clientFields.unsubscribedAt,
+        bounced_at: clientFields.bouncedAt,
+        updated_at: new Date().toISOString(),
+      };
+      // Strip undefined keys so Supabase doesn't null out columns we didn't touch
+      Object.keys(dbRow).forEach(k => dbRow[k] === undefined && delete dbRow[k]);
+
+      if (existingId) {
+        updates.push(
+          supabase.from('lead_analysis').update(dbRow).eq('id', existingId)
+        );
+      } else {
+        updates.push(
+          supabase.from('lead_analysis').insert({
+            id: generateUUID(),
+            lead_id: leadId,
+            campaign_id: campaignId,
+            user_id: userId,
+            sent_status: 'not-sent',
+            batch_status: null,
+            ...dbRow,
+          })
+        );
+      }
+    }
+
+    const results = await Promise.allSettled(updates);
+    const failed = results.filter(r => r.status === 'rejected');
+    if (failed.length > 0) {
+      console.error('[DB] saveBulkAnalysis: some rows failed to save:', failed);
+    }
+  } finally {
+    resolveLock!();
   }
-  const { error } = await supabase
-    .from('lead_analysis')
-    .upsert(rows, { onConflict: 'id' });
-  if (error) console.error('[DB] saveBulkAnalysis error:', JSON.stringify(error, null, 2) || error);
 };
 
 export const deleteCampaignAnalysis = async (campaignId: string) => {
@@ -630,14 +762,24 @@ export const saveReplyStatus = async (
   leadSupabaseId: string,
   status: any
 ) => {
-  // Fetch any existing reply_status row to get its ID for primary key upsert
+  // Read-merge-write: both client and server independently detect replies by
+  // polling Gmail, so either can have the more current answer. Never let a
+  // stale client write regress a flag the server already flipped true.
   const { data: existing } = await supabase
     .from('reply_status')
-    .select('id')
+    .select('id, has_replied, is_unsubscribed, is_negative, is_bounced, reply_count')
     .eq('lead_id', leadSupabaseId)
     .maybeSingle();
 
   const existingId = existing?.id;
+
+  const merged = {
+    has_replied: !!(existing?.has_replied || status.hasReplied),
+    is_unsubscribed: !!(existing?.is_unsubscribed || status.isUnsubscribed),
+    is_negative: !!(existing?.is_negative || status.isNegative),
+    is_bounced: !!(existing?.is_bounced || status.isBounced),
+    reply_count: Math.max(existing?.reply_count || 0, status.replyCount || 0),
+  };
 
   const { error } = await supabase
     .from('reply_status')
@@ -646,11 +788,7 @@ export const saveReplyStatus = async (
       lead_id: leadSupabaseId,
       campaign_id: campaignId,
       user_id: userId,
-      has_replied: status.hasReplied || false,
-      is_unsubscribed: status.isUnsubscribed || false,
-      is_negative: status.isNegative || false,
-      is_bounced: status.isBounced || false,
-      reply_count: status.replyCount || 0,
+      ...merged,
       last_checked: new Date().toISOString(),
       updated_at: new Date().toISOString(),
     }, { onConflict: 'id' });
@@ -758,6 +896,22 @@ export const deleteEmailTemplate = async (templateId: string) => {
 // ============================================================
 
 export const getBatchSchedule = async (campaignId: string) => {
+  const { data, error } = await supabase
+    .from('campaigns')
+    .select('batch_schedule')
+    .eq('id', campaignId)
+    .single();
+
+  if (!error) {
+    const schedule = data?.batch_schedule || null;
+    if (typeof window !== 'undefined' && schedule) {
+      // keep the cache warm for offline/failure fallback only — never read from it first
+      localStorage.setItem(`batch_schedule_${campaignId}`, JSON.stringify(schedule));
+    }
+    return schedule;
+  }
+
+  console.warn('[DB] getBatchSchedule: Supabase read failed, falling back to local cache:', error);
   if (typeof window !== 'undefined') {
     const cached = localStorage.getItem(`batch_schedule_${campaignId}`);
     if (cached) {
@@ -766,14 +920,7 @@ export const getBatchSchedule = async (campaignId: string) => {
       } catch (e) {}
     }
   }
-
-  const { data, error } = await supabase
-    .from('campaigns')
-    .select('batch_schedule')
-    .eq('id', campaignId)
-    .single();
-  if (error) return null;
-  return data?.batch_schedule || null;
+  return null;
 };
 
 export const saveBatchSchedule = async (campaignId: string, schedule: any) => {

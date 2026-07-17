@@ -2,7 +2,8 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import * as XLSX from 'xlsx';
 import Papa from 'papaparse';
 import { toast } from 'react-hot-toast';
-import { getCampaigns, saveCampaign, deleteCampaign, getLastOpenedCampaign, updateCampaignLastOpened, getLeads, saveLeads, deleteCampaignLeads, getAnalysis, saveAnalysis, saveBulkAnalysis, deleteCampaignAnalysis, getReplyStatus, saveReplyStatus, deleteCampaignReplyStatus, getReputation, saveReputation, getEmailTemplates, saveEmailTemplate, deleteEmailTemplate, getBatchSchedule, saveBatchSchedule } from '../lib/db';
+import { getCampaigns, saveCampaign, deleteCampaign, getLastOpenedCampaign, updateCampaignLastOpened, getLeads, saveLeads, reconcileLeadDeletions, deleteCampaignLeads, getAnalysis, saveAnalysis, saveBulkAnalysis, deleteCampaignAnalysis, getReplyStatus, saveReplyStatus, deleteCampaignReplyStatus, getReputation, saveReputation, getEmailTemplates, saveEmailTemplate, deleteEmailTemplate, getBatchSchedule, saveBatchSchedule, SERVER_OWNED_DB_TO_CLIENT_FIELD } from '../lib/db';
+import { supabase } from '../lib/supabase';
 
 // Custom Fetch Wrapper to automatically sync refreshed Google tokens from the server
 const customFetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
@@ -34,6 +35,7 @@ interface Campaign {
   id: string;
   name: string;
   country: string;
+  timezone?: string;
   createdAt: string;
   lastOpened?: string;
   leadCount?: number;
@@ -49,11 +51,41 @@ interface Campaign {
   followUp1Days?: number;
   followUp2Days?: number;
   followUp3Days?: number;
+  scheduleStartTime?: string;
+  scheduleEndTime?: string;
+  dailyLimit?: number;
 }
 
 const FOLLOW_UP_DAYS = [3, 10, 17]; // days after last email to send follow‑up 1,2,3
 const GEMINI_RATE_LIMIT = 14; // 1 below Gemini's 15 req/min limit
 const BATCH_WINDOW_MS = 62000; // 62 seconds per batch window
+
+const TIMEZONE_MAP: Record<string, string> = {
+  'United Kingdom': 'Europe/London',
+  'United States': 'America/New_York',
+  'Nigeria': 'Africa/Lagos',
+  'Canada': 'America/Toronto',
+  'Australia': 'Australia/Sydney',
+  'South Africa': 'Africa/Johannesburg',
+  'Ghana': 'Africa/Accra',
+  'Kenya': 'Africa/Nairobi',
+  'India': 'Asia/Kolkata',
+  'Germany': 'Europe/Berlin',
+  'France': 'Europe/Paris',
+};
+
+// Mirrors server's zonedTimeToUtc — converts a wall-clock date+time, entered
+// as "in the campaign's local timezone", into the correct UTC instant.
+// Needed client-side because this file can't import server code.
+const zonedTimeToUtc = (dateStr: string, timeStr: string, timeZone: string): Date => {
+  const [year, month, day] = dateStr.split('-').map(Number);
+  const [hour, minute] = (timeStr || '09:00').split(':').map(Number);
+  const utcGuess = new Date(Date.UTC(year, month - 1, day, hour, minute, 0));
+  const tzString = utcGuess.toLocaleString('en-US', { timeZone });
+  const tzDate = new Date(tzString);
+  const offsetMs = utcGuess.getTime() - tzDate.getTime();
+  return new Date(utcGuess.getTime() + offsetMs);
+};
 
 const generateUUID = () => {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
@@ -545,6 +577,17 @@ const getLeadStatus = (score: number, campaignIndustry?: string): string => {
   return 'cold-lead';
 };
 
+const isWithinCampaignWindow = (startTime: string, endTime: string, timezone: string): boolean => {
+  const nowInTz = new Date(new Date().toLocaleString('en-US', { timeZone: timezone }));
+  const [startHour, startMinute] = (startTime || '09:00').split(':').map(Number);
+  const [endHour, endMinute] = (endTime || '17:00').split(':').map(Number);
+  const startTimeToday = new Date(nowInTz);
+  startTimeToday.setHours(startHour, startMinute, 0, 0);
+  const endTimeToday = new Date(nowInTz);
+  endTimeToday.setHours(endHour, endMinute, 0, 0);
+  return nowInTz >= startTimeToday && nowInTz <= endTimeToday;
+};
+
 // ============================================================
 // MAIN COMPONENT
 // ============================================================
@@ -629,6 +672,28 @@ export default function SEOAutomation() {
     if (!selectedCampaignId) return;
     setCampaigns(prev => prev.map(c => 
       c.id === selectedCampaignId ? { ...c, senderAccountId: senderId } : c
+    ));
+  };
+
+  const setCampaignDailyLimit = (limit: number) => {
+    if (!selectedCampaignId) return;
+    setDailyLimit(limit); // keep local state in sync for immediate UI feedback
+    setCampaigns(prev => prev.map(c =>
+      c.id === selectedCampaignId ? { ...c, dailyLimit: limit } : c
+    ));
+  };
+
+  const setCampaignScheduleStartTime = (time: string) => {
+    if (!selectedCampaignId) return;
+    setCampaigns(prev => prev.map(c => 
+      c.id === selectedCampaignId ? { ...c, scheduleStartTime: time } : c
+    ));
+  };
+
+  const setCampaignScheduleEndTime = (time: string) => {
+    if (!selectedCampaignId) return;
+    setCampaigns(prev => prev.map(c => 
+      c.id === selectedCampaignId ? { ...c, scheduleEndTime: time } : c
     ));
   };
 
@@ -812,6 +877,9 @@ export default function SEOAutomation() {
   const isLoadingRef = useRef(false);
   const lastSavedLeadsJsonRef = useRef<string>('');
   const lastSavedAnalyzedLeadsRef = useRef<string>('');
+  const lastSavedReplyStatusRef = useRef<string>('');
+  const skipNextAnalyzedSaveRef = useRef(false);
+  const skipNextReplyStatusSaveRef = useRef(false);
 
   const saveToSession = useCallback(async (results: Record<number, any>) => {
     if (selectedCampaignId) {
@@ -839,7 +907,8 @@ export default function SEOAutomation() {
         setAnalyzedLeads(resultsData || {});
         
         const repliesData = await getReplyStatus(selectedCampaignId);
-         setReplyStatus(repliesData || {});
+        lastSavedReplyStatusRef.current = JSON.stringify(repliesData || {});
+        setReplyStatus(repliesData || {});
 
         const repData = await getReputation(selectedCampaignId);
         setReputationData({
@@ -862,6 +931,108 @@ export default function SEOAutomation() {
       }
     };
     loadCampaignData();
+  }, [selectedCampaignId]);
+  
+  // Live-sync server-owned fields (sent status, follow-up flags, etc.) so the
+  // UI reflects sends that happened via cron while this tab was just sitting
+  // open with stale local state — without touching any client-owned fields
+  // the user might be actively editing (email body, analysis data, etc.)
+  useEffect(() => {
+    if (!selectedCampaignId) return;
+
+    const channel = supabase
+      .channel(`lead_analysis_live_${selectedCampaignId}`)
+      .on(
+        'postgres_changes',
+        { event: 'UPDATE', schema: 'public', table: 'lead_analysis', filter: `campaign_id=eq.${selectedCampaignId}` },
+        (payload) => {
+          const newRow = payload.new as any;
+          if (!newRow?.lead_id) return;
+
+          setLeads(currentLeads => {
+            const lead = currentLeads.find(l => l._supabaseId === newRow.lead_id);
+            if (!lead) return currentLeads; // lead not loaded locally yet, nothing to merge into
+
+            setAnalyzedLeads(prev => {
+              const existing = prev[lead.rowIndex];
+              if (!existing) return prev; // no local analysis to merge into
+
+              const serverPatch: any = {};
+              for (const [dbCol, clientField] of Object.entries(SERVER_OWNED_DB_TO_CLIENT_FIELD)) {
+                if (newRow[dbCol] !== undefined) serverPatch[clientField] = newRow[dbCol];
+              }
+
+              skipNextAnalyzedSaveRef.current = true;
+              return {
+                ...prev,
+                [lead.rowIndex]: { ...existing, ...serverPatch },
+              };
+            });
+
+            return currentLeads; // this setter is just for the read, no actual leads change
+          });
+        }
+      )
+      .on(
+        'postgres_changes',
+        { event: 'UPDATE', schema: 'public', table: 'reply_status', filter: `campaign_id=eq.${selectedCampaignId}` },
+        (payload) => {
+          const newRow = payload.new as any;
+          if (!newRow?.lead_id) return;
+
+          setLeads(currentLeads => {
+            const lead = currentLeads.find(l => l._supabaseId === newRow.lead_id);
+            if (!lead) return currentLeads;
+
+            setReplyStatus(prev => {
+              skipNextReplyStatusSaveRef.current = true;
+              return {
+                ...prev,
+                [lead.rowIndex]: {
+                  hasReplied: newRow.has_replied,
+                  unsubscribed: newRow.is_unsubscribed,
+                  replyCount: newRow.reply_count,
+                  lastChecked: newRow.last_checked,
+                },
+              };
+            });
+
+            return currentLeads;
+          });
+        }
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [selectedCampaignId]);
+
+  // Fallback slow poll for reliability in case WebSocket disconnects
+  useEffect(() => {
+    if (!selectedCampaignId) return;
+    const interval = setInterval(async () => {
+      try {
+        const fresh = await getAnalysis(selectedCampaignId);
+        skipNextAnalyzedSaveRef.current = true;
+        setAnalyzedLeads(prev => {
+          const merged = { ...prev };
+          for (const [rowIndex, freshRow] of Object.entries(fresh)) {
+            const rx = Number(rowIndex);
+            if (!merged[rx]) continue;
+            const serverPatch: any = {};
+            for (const clientField of Object.values(SERVER_OWNED_DB_TO_CLIENT_FIELD)) {
+              if ((freshRow as any)[clientField] !== undefined) serverPatch[clientField] = (freshRow as any)[clientField];
+            }
+            merged[rx] = { ...merged[rx], ...serverPatch };
+          }
+          return merged;
+        });
+      } catch (e) {
+        console.error('[LIVE SYNC] Fallback poll failed:', e);
+      }
+    }, 90 * 1000); // 90s — realtime should beat this most of the time, this is just a safety net
+    return () => clearInterval(interval);
   }, [selectedCampaignId]);
   
   // Save leads when they change and sync back _supabaseId
@@ -901,6 +1072,12 @@ export default function SEOAutomation() {
     if (!selectedCampaignId || selectedCampaignId !== loadedCampaignIdRef.current) return;
     if (!Object.keys(analyzedLeads).length) return;
 
+    if (skipNextAnalyzedSaveRef.current) {
+      skipNextAnalyzedSaveRef.current = false;
+      lastSavedAnalyzedLeadsRef.current = JSON.stringify(analyzedLeads);
+      return;
+    }
+
     const serializeAnalyzed = JSON.stringify(analyzedLeads);
     if (serializeAnalyzed === lastSavedAnalyzedLeadsRef.current) return;
 
@@ -920,8 +1097,19 @@ export default function SEOAutomation() {
   useEffect(() => {
     if (!selectedCampaignId || selectedCampaignId !== loadedCampaignIdRef.current) return;
     if (!Object.keys(replyStatus).length) return;
+
+    if (skipNextReplyStatusSaveRef.current) {
+      skipNextReplyStatusSaveRef.current = false;
+      lastSavedReplyStatusRef.current = JSON.stringify(replyStatus);
+      return;
+    }
+
+    const serializeReplyStatus = JSON.stringify(replyStatus);
+    if (serializeReplyStatus === lastSavedReplyStatusRef.current) return;
+
     const persist = async () => {
       try {
+        lastSavedReplyStatusRef.current = serializeReplyStatus;
         await Promise.all(Object.entries(replyStatus).map(([rowIndex, status]: [string, any]) => {
           const lead = leads.find(l => l.rowIndex === parseInt(rowIndex));
           if (!lead?._supabaseId) return Promise.resolve();
@@ -948,16 +1136,26 @@ export default function SEOAutomation() {
     }
   }, [reputationData, selectedCampaignId]);
   
-  // Save campaigns list
+  // Replace the "save all campaigns on any change" effect with a diff-aware
+  // save — track which campaign id actually changed and save only that one.
+  const prevCampaignsRef = useRef<Campaign[]>([]);
   useEffect(() => {
-    const persistCampaigns = async () => {
+    const prev = prevCampaignsRef.current;
+    const changed = campaigns.filter(c => {
+      const old = prev.find(p => p.id === c.id);
+      return !old || JSON.stringify(old) !== JSON.stringify(c);
+    });
+
+    const persistCampaign = async (campaign: Campaign) => {
       try {
-        await Promise.all(campaigns.map(c => saveCampaign(c, userId)));
+        await saveCampaign(campaign, userId);
       } catch (err) {
-        console.error('Error saving campaigns:', err);
+        console.error('Error saving campaign:', err);
       }
     };
-    persistCampaigns();
+
+    changed.forEach(persistCampaign);
+    prevCampaignsRef.current = campaigns;
   }, [campaigns]);
 
   const createCampaign = async (name: string, country: string) => {
@@ -966,6 +1164,7 @@ export default function SEOAutomation() {
       id: newId,
       name,
       country,
+      timezone: TIMEZONE_MAP[country] || 'UTC',
       industry: newCampaignIndustry,
       decisionMakerTitle: newCampaignDecisionMaker,
       icpContext: newCampaignIcpContext,
@@ -1125,6 +1324,13 @@ export default function SEOAutomation() {
   const [sendingQueue, setSendingQueue] = useState(false);
   const [queueProgress, setQueueProgress] = useState({ current: 0, total: 0 });
   const [dailyLimit, setDailyLimit] = useState(30);
+
+  // Load/synchronize dailyLimit with active campaign
+  useEffect(() => {
+    if (currentCampaign) {
+      setDailyLimit(currentCampaign.dailyLimit ?? 50);
+    }
+  }, [selectedCampaignId, currentCampaign]);
   const [showScheduleModal, setShowScheduleModal] = useState(false);
   const [showBatchScheduleModal, setShowBatchScheduleModal] = useState(false);
   const [batchDays, setBatchDays] = useState(3);
@@ -1612,6 +1818,7 @@ export default function SEOAutomation() {
       if (selectedCampaignId) {
         try {
           savedLeads = await saveLeads(selectedCampaignId, userId, mappedLeads);
+          await reconcileLeadDeletions(selectedCampaignId, savedLeads); // explicit, deliberate
           setLeads(savedLeads);
           localStorage.setItem(getCampaignLeadsKey(selectedCampaignId), JSON.stringify(savedLeads));
         } catch (saveErr) {
@@ -2336,6 +2543,72 @@ export default function SEOAutomation() {
     });
   };
 
+  const pollIntervalRef = useRef<any>(null);
+
+  const stopProgressPolling = () => {
+    if (pollIntervalRef.current) {
+      clearInterval(pollIntervalRef.current);
+      pollIntervalRef.current = null;
+    }
+  };
+
+  const startProgressPolling = (targetRowIndexes: number[], campaignId: string) => {
+    if (targetRowIndexes.length === 0) return;
+    stopProgressPolling();
+    setQueueProgress({ current: 0, total: targetRowIndexes.length });
+    setSendingQueue(true);
+    const targetSet = new Set(targetRowIndexes);
+
+    pollIntervalRef.current = setInterval(async () => {
+      try {
+        const fresh = await getAnalysis(campaignId);
+        let sentCount = 0;
+        let doneCount = 0;
+        targetSet.forEach(rowIndex => {
+          const status = fresh[rowIndex]?.sentStatus;
+          const bStatus = fresh[rowIndex]?.batchStatus;
+          if (status === 'sent') sentCount++;
+          if (
+            ['sent', 'failed', 'bounced', 'unsubscribed'].includes(status) || 
+            ['sent', 'failed'].includes(bStatus)
+          ) {
+            doneCount++;
+          }
+        });
+        setQueueProgress({ current: sentCount, total: targetSet.size });
+        setAnalyzedLeads(prev => ({ ...prev, ...fresh }));
+
+        if (doneCount >= targetSet.size) {
+          stopProgressPolling();
+          setSendingQueue(false);
+          toast.success(`Done: ${sentCount} of ${targetSet.size} sent.`);
+        }
+      } catch (err) {
+        console.error('[PROGRESS POLL] error:', err);
+      }
+    }, 4000);
+  };
+
+  const cancelSendInProgress = async () => {
+    if (!selectedCampaignId) return;
+    try {
+      await fetchWithGoogleAuth('/api/cancel-send', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ campaignId: selectedCampaignId })
+      });
+      toast('Stopping — leads already sent will not be undone.');
+    } catch {
+      toast.error('Cancel signal failed to send, stopping tracking locally anyway.');
+    }
+    stopProgressPolling();
+    setSendingQueue(false);
+  };
+
+  useEffect(() => {
+    return () => stopProgressPolling();
+  }, []);
+
   // FUNCTION 5: Send queue now (completely delegated to server background runner!)
   const sendQueueNow = async () => {
     if (!isAuthenticated) {
@@ -2343,8 +2616,22 @@ export default function SEOAutomation() {
       return;
     }
 
+    const targetRows = leads
+      .filter(l => {
+        const a = analyzedLeads[l.rowIndex];
+        return a && (a.initialEmail?.body || a.aiAnalysis?.initialEmail?.body || a.initial_email?.body || a.ai_analysis?.initialEmail?.body)
+          && a.sentStatus !== 'sent' && a.sentStatus !== 'unsubscribed'
+          && l.email;
+      })
+      .map(l => l.rowIndex);
+
+    if (targetRows.length === 0) {
+      toast.error('No emails ready to send');
+      return;
+    }
+
     try {
-      toast.loading('Queueing all emails for autonomous server background sending...');
+      toast.loading('Queueing emails for background sending...');
       const response = await fetchWithGoogleAuth('/api/queue-all-now', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -2362,23 +2649,24 @@ export default function SEOAutomation() {
 
       // Update UI state
       const updatedAnalyzed = { ...analyzedLeads };
-      Object.keys(updatedAnalyzed).forEach((rowIndex: any) => {
-        const lead = leads.find(l => l.rowIndex === parseInt(rowIndex));
-        if (lead && lead.email) {
-          const a = updatedAnalyzed[rowIndex];
-          if (a && a.sentStatus !== 'sent' && a.sentStatus !== 'unsubscribed') {
-            updatedAnalyzed[rowIndex] = {
-              ...a,
-              batchStatus: 'queued',
-              sentStatus: 'not-sent'
-            };
-          }
+      const nowIso = new Date().toISOString();
+      targetRows.forEach(rowIndex => {
+        const a = updatedAnalyzed[rowIndex];
+        if (a) {
+          updatedAnalyzed[rowIndex] = {
+            ...a,
+            batchStatus: `queued:${nowIso}`,
+            sentStatus: 'not-sent'
+          };
         }
       });
       setAnalyzedLeads(updatedAnalyzed);
       saveToSession(updatedAnalyzed);
 
-      toast.success('Queue processing! The server is now running autonomously in the background. You can safely close this tab.');
+      if (selectedCampaignId) {
+        startProgressPolling(targetRows, selectedCampaignId);
+      }
+      toast.success('Sending started.');
     } catch (err: any) {
       toast.dismiss();
       console.error('Failed to queue on server:', err);
@@ -2389,23 +2677,24 @@ export default function SEOAutomation() {
   const sendFollowUpEmail = async (lead: any, followUpKey: 'followUp1' | 'followUp2' | 'followUp3', daysLabel: string) => {
     const analysis = analyzedLeads[lead.rowIndex];
     if (!analysis) return false;
-    
+
     let emailBody = analysis[followUpKey] || analysis.aiAnalysis?.[followUpKey];
     if (!emailBody) {
       console.warn(`No ${followUpKey} content for ${lead.company}`);
+      toast.error(`${lead.company}: no ${followUpKey} content generated. Regenerate emails for this lead.`);
       return false;
     }
-    
+
     const rawFollowUpBody = emailBody;
-    const followUpSignatureMatches = rawFollowUpBody?.match(/Tosin[\s\S]*?/g);
     emailBody = rawFollowUpBody?.replace(/(\bTosin\b[\s\S]*?)(\s*\bTosin\b[\s\S]*?)$/, '$1') || rawFollowUpBody;
-    
     emailBody = replaceTokens(emailBody, lead);
-    
+
     const originalSubject = analysis.initialEmail?.subject || analysis.aiAnalysis?.initialEmail?.subject || 'Your website';
     const rawSubject = originalSubject.toLowerCase().startsWith('re:') ? originalSubject : `Re: ${originalSubject}`;
     const subject = replaceTokens(rawSubject, lead);
-    
+
+    const serverFollowUpKey = followUpKey.replace('followUp', 'follow_up'); // followUp1 -> follow_up1
+
     try {
       const res = await fetchWithGoogleAuth('/api/send-email', {
         method: 'POST',
@@ -2415,7 +2704,10 @@ export default function SEOAutomation() {
           body: emailBody,
           accountId: currentCampaign?.senderAccountId || undefined,
           threadId: analysis.initialThreadId || undefined,
-          previousMessageId: analysis.initialMessageId || undefined
+          previousMessageId: analysis.initialMessageId || undefined,
+          campaignId: selectedCampaignId,
+          leadAnalysisId: analysis._supabaseId,
+          followUpKey: serverFollowUpKey,
         })
       });
       const data = await res.json();
@@ -2436,9 +2728,12 @@ export default function SEOAutomation() {
         });
         toast.success(`📨 Follow-up ${daysLabel} sent to ${lead.company}`);
         return true;
+      } else if (res.status === 409) {
+        // Already claimed by the server cron, or lead replied/unsubscribed since last check — not an error
+        console.log(`[FOLLOWUP] Skipped ${lead.company}: ${data.error}`);
+        return false;
       } else {
-        const errorMsg = data.error || 'Server error';
-        toast.error(`Failed to send follow-up to ${lead.company}: ${errorMsg}`);
+        toast.error(`Failed to send follow-up to ${lead.company}: ${data.error || 'Server error'}`);
       }
     } catch (err: any) {
       if (err.name === 'TypeError' || err.message?.includes('fetch') || err.message?.includes('network')) {
@@ -2463,19 +2758,16 @@ export default function SEOAutomation() {
       return;
     }
 
+    const now = new Date(); // computed fresh at call time — do NOT hoist to component scope
+
     // Use follow-up window from campaign (default 14:00-16:00)
     const followUpStart = currentCampaign?.followUpStartTime || '14:00';
     const followUpEnd = currentCampaign?.followUpEndTime || '16:00';
-    const [startHour, startMinute] = followUpStart.split(':').map(Number);
-    const [endHour, endMinute] = followUpEnd.split(':').map(Number);
-    const startTimeToday = new Date();
-    startTimeToday.setHours(startHour, startMinute, 0, 0);
-    const endTimeToday = new Date();
-    endTimeToday.setHours(endHour, endMinute, 0, 0);
-    const now = new Date();
+    const campaignCountry = currentCampaign?.country || 'US';
+    const tz = currentCampaign?.timezone || TIMEZONE_MAP[campaignCountry] || 'UTC';
 
-    if (now < startTimeToday || now > endTimeToday) {
-      if (!silent) toast(`Follow-up window is ${followUpStart} - ${followUpEnd}. Will send during this window.`);
+    if (!isWithinCampaignWindow(followUpStart, followUpEnd, tz)) {
+      if (!silent) toast(`Follow-up window is ${followUpStart} - ${followUpEnd} in campaign timezone (${tz}).`);
       return;
     }
 
@@ -2529,16 +2821,6 @@ export default function SEOAutomation() {
     setSendingQueue(false);
     if (!silent) toast.success('Follow-up batch completed');
   };
-
-  // Automatic follow-up checker (hourly)
-  useEffect(() => {
-    if (!selectedCampaignId || !isAuthenticated) return;
-    const interval = setInterval(() => {
-      if (!sendingQueue) sendDueFollowUps(true);
-    }, 60 * 60 * 1000);
-    return () => clearInterval(interval);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedCampaignId, isAuthenticated, sendingQueue]);
 
   const exportCampaignToCSV = () => {
     if (leads.length === 0) {
@@ -2859,12 +3141,11 @@ export default function SEOAutomation() {
   };
 
   const executeScheduledSend = async () => {
-    const now = new Date();
-    const [hours, minutes] = scheduleSettings.startTime.split(':').map(Number);
-    const sendTime = new Date(scheduleSettings.sendDate);
-    sendTime.setHours(hours, minutes, 0, 0);
+    // Validate against the campaign's timezone, not the browser's
+    const tz = currentCampaign?.timezone || TIMEZONE_MAP[campaignCountry] || 'UTC';
+    const scheduledInstant = zonedTimeToUtc(scheduleSettings.sendDate, scheduleSettings.startTime, tz);
 
-    if (sendTime < now) {
+    if (scheduledInstant < new Date()) {
       toast.error('Scheduled time is in the past. Please choose a future time.');
       return;
     }
@@ -2886,45 +3167,45 @@ export default function SEOAutomation() {
     try {
       toast.loading(`Scheduling ${readyToSend.length} emails for server background send...`);
 
-      const batchSchedule = [
-        {
-          day: 1,
-          time: `${hours < 10 ? '0' : ''}${hours}:${minutes < 10 ? '0' : ''}${minutes}`,
-          leads: readyToSend
-        }
-      ];
+      const batchSchedule = [{
+        day: 1,
+        time: scheduleSettings.startTime,
+        leads: readyToSend
+      }];
 
       const response = await fetchWithGoogleAuth('/api/queue-initial-sends', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           campaignId: selectedCampaignId,
-          batchSchedule: batchSchedule,
-          sendStartDate: sendTime.toISOString()
+          batchSchedule,
+          sendDateRaw: scheduleSettings.sendDate,   // e.g. '2026-07-20'
+          sendTimeRaw: scheduleSettings.startTime,  // e.g. '09:00'
         })
       });
 
       toast.dismiss();
-
       if (!response.ok) {
         const errData = await response.json();
         throw new Error(errData.error || 'Server error');
+      }
+
+      if (selectedCampaignId) {
+        startProgressPolling(readyToSend.map(l => l.rowIndex), selectedCampaignId);
       }
 
       const updatedAnalyzed = { ...analyzedLeads };
       readyToSend.forEach((lead) => {
         updatedAnalyzed[lead.rowIndex] = {
           ...updatedAnalyzed[lead.rowIndex],
-          batchStatus: 'queued',
+          batchStatus: `queued:pending-server-resolve`,
           sentStatus: 'not-sent'
         };
       });
       setAnalyzedLeads(updatedAnalyzed);
       saveToSession(updatedAnalyzed);
 
-      const delayMinutes = Math.round((sendTime.getTime() - now.getTime()) / 60000);
-      const delayHours = Math.round(delayMinutes / 60);
-      toast.success(`Autopilot Active! Queue scheduled on the server for ${delayHours > 0 ? delayHours + ' hours' : delayMinutes + ' minutes'} from now. You can safely close this tab.`);
+      toast.success(`Autopilot Active! Queue scheduled on the server for ${scheduleSettings.sendDate} at ${scheduleSettings.startTime} (${tz}). You can safely close this tab.`);
       setShowScheduleModal(false);
     } catch (err: any) {
       toast.dismiss();
@@ -3105,7 +3386,11 @@ export default function SEOAutomation() {
         analyzedCount: Object.keys(analyzedLeads).length,
         hotLeads: Object.values(analyzedLeads).filter((a: any) => a.status === 'hot-lead').length,
         warmLeads: Object.values(analyzedLeads).filter((a: any) => a.status === 'warm-lead').length,
-        emailsReady: Object.values(analyzedLeads).filter((a: any) => a.initialEmail?.body || a.aiAnalysis?.initialEmail?.body).length,
+        emailsReady: Object.values(analyzedLeads).filter((a: any) => 
+          (a.initialEmail?.body || a.aiAnalysis?.initialEmail?.body || a.initial_email?.body || a.ai_analysis?.initialEmail?.body)
+          && a.sentStatus !== 'sent'
+          && a.sentStatus !== 'unsubscribed'
+        ).length,
         mikeActionLog: mikeActionLog,
       };
 
@@ -3242,12 +3527,24 @@ const lockBatchSchedule = async () => {
       throw new Error(errData.error || 'Server error');
     }
 
+    const day1Leads = batchPreview[0]?.leads || [];
+    if (selectedCampaignId) {
+      startProgressPolling(day1Leads.map((l: any) => l.rowIndex), selectedCampaignId);
+    }
+
     batchPreview.forEach(batch => {
+      const batchDay = batch.day || 1;
+      let scheduledDate = new Date(startIso);
+      if (batchDay > 1) {
+        scheduledDate = addBusinessDays(startIso ? new Date(startIso) : new Date(), batchDay - 1);
+      }
+      const scheduledIso = scheduledDate.toISOString();
+
       batch.leads.forEach((lead: any) => {
         updatedAnalyzed[lead.rowIndex] = {
           ...updatedAnalyzed[lead.rowIndex],
           batchNumber: batch.day,
-          batchStatus: 'queued',
+          batchStatus: `queued:${scheduledIso}`,
           sentStatus: 'not-sent'
         };
       });
@@ -3280,7 +3577,7 @@ const lockBatchSchedule = async () => {
       totalBatches: batchPreview.length,
     });
 
-    toast.success(`Autopilot Active! Server is now scheduling and sending your ${batchPreview.length}-day campaign in the background. You can safely close this tab.`);
+    toast.success(`Autopilot Active! Server is now scheduling and sending your ${batchPreview.length}-day campaign in the background (times shown are in ${currentCampaign?.timezone || campaignCountry} local time). You can safely close this tab.`);
   } catch (err: any) {
     toast.dismiss();
     console.error('Failed to schedule batch on server:', err);
@@ -3304,7 +3601,7 @@ const sendActiveBatch = async () => {
     return;
   }
 
-  const leadIds = batchLeads.map((l: any) => l.id);
+  const leadIds = batchLeads.map((l: any) => l._supabaseId);
 
   try {
     toast.loading(`Triggering background batch send for Day ${activeBatchBanner.day} (${batchLeads.length} leads)...`);
@@ -3327,15 +3624,20 @@ const sendActiveBatch = async () => {
 
     // Update UI state to reflect queued/not-sent status on server
     const updatedAnalyzed = { ...analyzedLeads };
+    const nowIso = new Date().toISOString();
     batchLeads.forEach((lead: any) => {
       updatedAnalyzed[lead.rowIndex] = {
         ...updatedAnalyzed[lead.rowIndex],
-        batchStatus: 'queued',
+        batchStatus: `queued:${nowIso}`,
         sentStatus: 'not-sent'
       };
     });
     setAnalyzedLeads(updatedAnalyzed);
     saveToSession(updatedAnalyzed);
+
+    if (selectedCampaignId) {
+      startProgressPolling(batchLeads.map((l: any) => l.rowIndex), selectedCampaignId);
+    }
 
     toast.success(`Server is sending Day ${activeBatchBanner.day} in the background! You can safely close this tab.`);
 
@@ -3455,7 +3757,11 @@ const sendActiveBatch = async () => {
   const hasReplied = selectedLead ? replyStatus[selectedLead.rowIndex]?.hasReplied : false;
   const analyzedCount = Object.keys(analyzedLeads).length;
   const hotLeads = Object.values(analyzedLeads).filter((a: any) => a.status === 'hot-lead').length;
-  const emailsReady = Object.values(analyzedLeads).filter((a: any) => a.initialEmail?.body).length;
+  const emailsReady = Object.values(analyzedLeads).filter((a: any) => 
+    (a.initialEmail?.body || a.aiAnalysis?.initialEmail?.body || a.initial_email?.body || a.ai_analysis?.initialEmail?.body)
+    && a.sentStatus !== 'sent'
+    && a.sentStatus !== 'unsubscribed'
+  ).length;
   const sentCount = Object.values(analyzedLeads).filter((a: any) => a?.sentStatus === 'sent').length;
   const notSentCount = Object.values(analyzedLeads).filter((a: any) => a?.sentStatus === 'not-sent' || !a?.sentStatus).length;
   const failedCount = Object.values(analyzedLeads).filter((a: any) => a?.sentStatus === 'failed').length;
@@ -3866,8 +4172,19 @@ const sendActiveBatch = async () => {
 
                   {/* Queue progress bar */}
                   {sendingQueue && (
-                    <div style={{ background: '#F1F5F9', borderRadius: 8, overflow: 'hidden', height: 6 }}>
-                      <div style={{ height: '100%', width: `${(queueProgress.current / queueProgress.total) * 100}%`, background: COLORS.green, borderRadius: 8, transition: 'width 0.3s ease' }} />
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 6, padding: '10px 12px', background: '#F0FDF4', border: `1px solid ${COLORS.green}`, borderRadius: 10 }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                        <span style={{ fontSize: 11, fontWeight: 700, color: COLORS.green }}>
+                          📤 Sending {queueProgress.current} of {queueProgress.total}
+                        </span>
+                        <button onClick={cancelSendInProgress}
+                          style={{ padding: '4px 10px', background: COLORS.red, color: 'white', border: 'none', borderRadius: 6, fontSize: 10, fontWeight: 700, cursor: 'pointer' }}>
+                          🛑 Stop Sending
+                        </button>
+                      </div>
+                      <div style={{ background: '#DCFCE7', borderRadius: 8, overflow: 'hidden', height: 6 }}>
+                        <div style={{ height: '100%', width: `${queueProgress.total ? (queueProgress.current / queueProgress.total) * 100 : 0}%`, background: COLORS.green, borderRadius: 8, transition: 'width 0.3s ease' }} />
+                      </div>
                     </div>
                   )}
 
@@ -4679,7 +4996,7 @@ const sendActiveBatch = async () => {
             <div style={{ background: NAVY_LIGHT, borderRadius: 16, padding: 18, marginBottom: 16 }}>
               <div style={{ fontSize: 9, color: AMBER, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.1em', marginBottom: 4 }}>Due Today</div>
               <div style={{ fontSize: 18, fontWeight: 900, color: 'white', marginBottom: 2 }}>{new Date().toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long' })}</div>
-              <div style={{ fontSize: 12, color: SLATE_LIGHT }}>Send window: 9:00 AM - 11:00 AM  {campaignCountry}</div>
+              <div style={{ fontSize: 12, color: SLATE_LIGHT }}>Send window: {currentCampaign?.scheduleStartTime || '09:00'} - {currentCampaign?.scheduleEndTime || '11:00'}  {campaignCountry}</div>
             </div>
             <div style={{ background: 'white', border: `1px solid ${NAVY_BORDER}`, borderRadius: 16, padding: 18, marginTop: 16 }}>
               <div style={{ fontSize: 11, fontWeight: 700, color: SLATE, textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 10 }}>Target Country</div>
@@ -4688,7 +5005,7 @@ const sendActiveBatch = async () => {
                 {['United Kingdom','United States','Nigeria','Canada','Australia','South Africa','Ghana','Kenya','India','Germany','France','Other'].map(c => <option key={c} value={c}>{c}</option>)}
               </select>
               <div style={{ padding: '12px 14px', background: AMBER_LIGHT, borderRadius: 10, fontSize: 12, color: NAVY }}>
-                ✉️ Emails send between <strong>9:00-11:00 AM</strong> local time in <strong>{campaignCountry}</strong> with randomised delays.
+                ✉️ Emails send between <strong>{currentCampaign?.scheduleStartTime || '09:00'} - {currentCampaign?.scheduleEndTime || '11:00'} AM</strong> local time in <strong>{campaignCountry}</strong> with randomised delays.
               </div>
             </div>
             <div style={{ background: 'white', border: `1px solid ${NAVY_BORDER}`, borderRadius: 16, padding: 18, marginTop: 16 }}>
@@ -4698,11 +5015,38 @@ const sendActiveBatch = async () => {
                 min="1" 
                 max="500" 
                 value={dailyLimit !== undefined && dailyLimit !== null && !isNaN(dailyLimit) ? dailyLimit : ''} 
-                onChange={e => setDailyLimit(Math.max(1, Math.min(500, parseInt(e.target.value) || 1)))}
+                onChange={e => setCampaignDailyLimit(Math.max(1, Math.min(500, parseInt(e.target.value) || 1)))}
                 style={{ width: '100%', padding: '10px 12px', borderRadius: 8, border: `1px solid ${NAVY_BORDER}`, fontSize: 12, color: NAVY, boxSizing: 'border-box', marginBottom: 10, background: 'white' }} 
               />
               <div style={{ padding: '12px 14px', background: '#F1F5F9', borderRadius: 10, fontSize: 11, color: SLATE, lineHeight: 1.5 }}>
                 ℹ️ Gmail allows up to 500 per day but 50 to 100 is the safe recommended range for cold outreach.
+              </div>
+            </div>
+
+            <div style={{ background: 'white', border: `1px solid ${NAVY_BORDER}`, borderRadius: 16, padding: 18, marginTop: 16 }}>
+              <div style={{ fontSize: 11, fontWeight: 700, color: SLATE, textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 10 }}>Sending Window (Local Time)</div>
+              <div style={{ display: 'flex', gap: 12, marginBottom: 10 }}>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontSize: 10, color: SLATE, marginBottom: 4 }}>Start Time</div>
+                  <input 
+                    type="time" 
+                    value={currentCampaign?.scheduleStartTime || '09:00'} 
+                    onChange={e => setCampaignScheduleStartTime(e.target.value)}
+                    style={{ width: '100%', padding: '10px 12px', borderRadius: 8, border: `1px solid ${NAVY_BORDER}`, fontSize: 12, color: NAVY, background: 'white' }} 
+                  />
+                </div>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontSize: 10, color: SLATE, marginBottom: 4 }}>End Time</div>
+                  <input 
+                    type="time" 
+                    value={currentCampaign?.scheduleEndTime || '11:00'} 
+                    onChange={e => setCampaignScheduleEndTime(e.target.value)}
+                    style={{ width: '100%', padding: '10px 12px', borderRadius: 8, border: `1px solid ${NAVY_BORDER}`, fontSize: 12, color: NAVY, background: 'white' }} 
+                  />
+                </div>
+              </div>
+              <div style={{ padding: '12px 14px', background: '#F1F5F9', borderRadius: 10, fontSize: 11, color: SLATE, lineHeight: 1.5 }}>
+                ℹ️ System will automatically queue and pace cold outreach sends within this window in the target campaign's timezone.
               </div>
             </div>
 

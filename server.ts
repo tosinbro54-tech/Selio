@@ -21,11 +21,13 @@ let supabaseInstance: any = null;
 function getSupabase() {
   if (!supabaseInstance) {
     const url = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL;
+    const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
     const anonKey = process.env.SUPABASE_ANON_KEY || process.env.VITE_SUPABASE_ANON_KEY;
-    if (!url || !anonKey) {
-      throw new Error('Missing SUPABASE_URL or SUPABASE_ANON_KEY env variables.');
+    const key = serviceKey || anonKey; // prefer service role on the server
+    if (!url || !key) {
+      throw new Error('Missing SUPABASE_URL or a Supabase key env variable.');
     }
-    supabaseInstance = createClient(url, anonKey);
+    supabaseInstance = createClient(url, key);
   }
   return supabaseInstance;
 }
@@ -54,6 +56,58 @@ const __filename = typeof import.meta !== 'undefined' && import.meta.url
 const __dirname = typeof __filename !== 'undefined' && __filename
   ? path.dirname(__filename)
   : (typeof __dirname !== 'undefined' ? __dirname : '');
+
+const TIMEZONE_MAP: Record<string, string> = {
+  'United Kingdom': 'Europe/London',
+  'United States': 'America/New_York',
+  'Nigeria': 'Africa/Lagos',
+  'Canada': 'America/Toronto',
+  'Australia': 'Australia/Sydney',
+  'South Africa': 'Africa/Johannesburg',
+  'Ghana': 'Africa/Accra',
+  'Kenya': 'Africa/Nairobi',
+  'India': 'Asia/Kolkata',
+  'Germany': 'Europe/Berlin',
+  'France': 'Europe/Paris',
+};
+
+function getCampaignTimezone(campaign: any): string {
+  return campaign.timezone || TIMEZONE_MAP[campaign.country] || 'UTC';
+}
+
+function isWithinWindow(startTime: string, endTime: string, timezone: string, now: Date = new Date()): boolean {
+  // Get "now" as it reads on a clock in the campaign's timezone
+  const nowInTz = new Date(now.toLocaleString('en-US', { timeZone: timezone }));
+
+  const [startHour, startMinute] = (startTime || '09:00').split(':').map(Number);
+  const [endHour, endMinute] = (endTime || '17:00').split(':').map(Number);
+
+  const startTimeToday = new Date(nowInTz);
+  startTimeToday.setHours(startHour, startMinute, 0, 0);
+  const endTimeToday = new Date(nowInTz);
+  endTimeToday.setHours(endHour, endMinute, 0, 0);
+
+  return nowInTz >= startTimeToday && nowInTz <= endTimeToday;
+}
+
+// Converts a wall-clock time (as entered by the user, meaning "in the campaign's
+// local timezone") into the correct UTC Date instant. Works without any date
+// library and correctly handles DST because it uses the actual calendar date.
+function zonedTimeToUtc(dateStr: string, timeStr: string, timeZone: string): Date {
+  const [year, month, day] = dateStr.split('-').map(Number);
+  const [hour, minute] = (timeStr || '09:00').split(':').map(Number);
+
+  // Treat the requested wall-clock time as if it were UTC, as a starting guess.
+  const utcGuess = new Date(Date.UTC(year, month - 1, day, hour, minute, 0));
+
+  // See what that UTC instant actually reads as in the target timezone.
+  const tzString = utcGuess.toLocaleString('en-US', { timeZone });
+  const tzDate = new Date(tzString);
+
+  // The gap between the guess and what it displays as in-zone IS the offset.
+  const offsetMs = utcGuess.getTime() - tzDate.getTime();
+  return new Date(utcGuess.getTime() + offsetMs);
+}
 
 const app = express();
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
@@ -232,59 +286,140 @@ app.post('/api/auth/refresh', async (req, res) => {
 
 // ============================================================
 // PERSISTENT ACCOUNT STORAGE — Supabase-backed so accounts survive restarts
+// Fallback local file system persistence added to resolve Supabase RLS write restrictions
 // ============================================================
 
-async function loadAdditionalAccounts(): Promise<Record<string, any>> {
+let additionalAccounts: Record<string, any> = {};
+
+const FALLBACK_ACCOUNTS_FILE = path.resolve(process.cwd(), 'gmail_accounts_fallback.json');
+
+function saveAccountsToFallbackFile() {
   try {
-    const { data, error } = await getSupabase().from('gmail_accounts').select('email, tokens');
-    if (error) {
-      console.warn('[ACCOUNTS] Note: gmail_accounts table not found or accessible yet. Skipping accounts pre-load.');
-      return {};
-    }
-    const result: Record<string, any> = {};
-    for (const row of (data || [])) { result[row.email] = row.tokens; }
-    return result;
+    fs.writeFileSync(FALLBACK_ACCOUNTS_FILE, JSON.stringify(additionalAccounts, null, 2), 'utf-8');
+    console.log('[ACCOUNTS] Saved accounts to local fallback file');
   } catch (err: any) {
-    console.warn('[ACCOUNTS] Skipping load startup (Supabase tables or connection not ready):', err.message || err);
-    return {};
+    console.error('[ACCOUNTS] Failed to write fallback file:', err.message);
   }
 }
 
+function loadAccountsFromFallbackFile(): Record<string, any> {
+  try {
+    if (fs.existsSync(FALLBACK_ACCOUNTS_FILE)) {
+      const content = fs.readFileSync(FALLBACK_ACCOUNTS_FILE, 'utf-8');
+      const data = JSON.parse(content);
+      console.log(`[ACCOUNTS] Loaded ${Object.keys(data).length} accounts from local fallback file`);
+      return data;
+    }
+  } catch (err: any) {
+    console.error('[ACCOUNTS] Failed to read fallback file:', err.message);
+  }
+  return {};
+}
+
+async function loadAdditionalAccounts(): Promise<Record<string, any>> {
+  let result: Record<string, any> = {};
+
+  // Always load from local file fallback first
+  const localAccounts = loadAccountsFromFallbackFile();
+  result = { ...localAccounts };
+
+  try {
+    const { data, error } = await getSupabase().from('gmail_accounts').select('email, tokens');
+    if (error) {
+      console.warn('[ACCOUNTS] Note: gmail_accounts table not accessible. Relying on local fallback.');
+    } else if (data) {
+      for (const row of data) {
+        result[row.email] = row.tokens;
+      }
+    }
+  } catch (err: any) {
+    console.warn('[ACCOUNTS] Supabase load failed, relying on local fallback:', err.message || err);
+  }
+
+  return result;
+}
+
 async function saveAdditionalAccount(email: string, tokens: any, isPrimary = false) {
-  const { error } = await getSupabase().from('gmail_accounts').upsert({
-    email,
-    tokens,
-    user_id: 'tosin',
-    updated_at: new Date().toISOString(),
-    is_primary: isPrimary
-  }, { onConflict: 'email' });
-  if (error) console.error('[ACCOUNTS] Failed to save:', error);
+  // Update in-memory and local fallback file
+  additionalAccounts[email] = tokens;
+  saveAccountsToFallbackFile();
+
+  try {
+    const { error } = await getSupabase().from('gmail_accounts').upsert({
+      email,
+      tokens,
+      user_id: 'tosin',
+      updated_at: new Date().toISOString(),
+      is_primary: isPrimary
+    }, { onConflict: 'email' });
+    if (error) console.error('[ACCOUNTS] Supabase save failed (likely RLS). Keeping locally:', error.message || error);
+  } catch (err: any) {
+    console.error('[ACCOUNTS] Supabase save error:', err.message || err);
+  }
 }
 
 async function deleteAdditionalAccount(email: string) {
-  const { error } = await getSupabase().from('gmail_accounts').delete().eq('email', email);
-  if (error) console.error('[ACCOUNTS] Failed to delete:', error);
+  if (additionalAccounts[email]) {
+    delete additionalAccounts[email];
+    saveAccountsToFallbackFile();
+  }
+
+  try {
+    const { error } = await getSupabase().from('gmail_accounts').delete().eq('email', email);
+    if (error) console.error('[ACCOUNTS] Failed to delete from Supabase:', error);
+  } catch (err: any) {
+    console.error('[ACCOUNTS] Supabase delete error:', err.message || err);
+  }
 }
 
 // ============================================================
 // QUOTA TRACKING — counts Selio sends per account per day
 // ============================================================
 
-async function getTodayQuota(accountEmail: string): Promise<number> {
-  const today = new Date().toISOString().slice(0, 10);
-  const { data, error } = await getSupabase().from('quota').select('count').eq('account_email', accountEmail).eq('date', today).single();
-  if (error) return 0;
-  return data?.count || 0;
+const inMemoryQuota: Record<string, Record<string, number>> = {}; // date -> email -> count
+
+async function getQuotaDateKey(campaignId?: string): Promise<string> {
+  let tz = 'UTC';
+  if (campaignId) {
+    try {
+      const { data } = await getSupabase().from('campaigns').select('timezone, country').eq('id', campaignId).maybeSingle();
+      if (data) tz = data.timezone || TIMEZONE_MAP[data.country] || 'UTC';
+    } catch {}
+  }
+  const inTz = new Date(new Date().toLocaleString('en-US', { timeZone: tz }));
+  return inTz.toISOString().slice(0, 10);
 }
 
-async function incrementQuota(accountEmail: string) {
-  const today = new Date().toISOString().slice(0, 10);
-  const current = await getTodayQuota(accountEmail);
-  const { error } = await getSupabase().from('quota').upsert({ user_id: 'tosin', account_email: accountEmail, date: today, count: current + 1 }, { onConflict: 'account_email,date' });
-  if (error) console.error('[QUOTA] Failed to increment:', error);
+async function getTodayQuota(accountEmail: string, campaignId?: string): Promise<number> {
+  const today = await getQuotaDateKey(campaignId);
+  let dbCount = 0;
+  try {
+    const { data, error } = await getSupabase().from('quota').select('count').eq('account_email', accountEmail).eq('date', today).single();
+    if (!error && data) {
+      dbCount = data.count || 0;
+    }
+  } catch (err) {}
+  
+  if (!inMemoryQuota[today]) inMemoryQuota[today] = {};
+  const memCount = inMemoryQuota[today][accountEmail] || 0;
+  return Math.max(dbCount, memCount);
 }
 
-let additionalAccounts: Record<string, any> = {};
+async function incrementQuota(accountEmail: string, campaignId?: string) {
+  const today = await getQuotaDateKey(campaignId);
+  const current = await getTodayQuota(accountEmail, campaignId);
+  const newCount = current + 1;
+  
+  if (!inMemoryQuota[today]) inMemoryQuota[today] = {};
+  inMemoryQuota[today][accountEmail] = newCount;
+
+  try {
+    const { error } = await getSupabase().from('quota').upsert({ user_id: 'tosin', account_email: accountEmail, date: today, count: newCount }, { onConflict: 'account_email,date' });
+    if (error) console.error('[QUOTA] Failed to increment:', error);
+  } catch (err) {
+    console.error('[QUOTA] Error incrementing quota:', err);
+  }
+}
 
 async function storeAccountTokens(accountId: string, tokens: any, isPrimary = false) {
   additionalAccounts[accountId] = tokens;
@@ -674,6 +809,7 @@ function getOpenAIClient() {
 // ============================================================
 
 const exhaustedModels = new Set<string>();
+const cancelledCampaigns = new Set<string>();
 
 function extractCleanErrorMessage(err: any): string {
   if (!err) return 'Unknown error';
@@ -2265,14 +2401,65 @@ app.post('/api/create-draft', async (req, res) => {
 // SEND EMAIL
 // ============================================================
 
+async function getCampaignDailyLimit(campaignId: string): Promise<number> {
+  try {
+    const { data } = await getSupabase().from('campaigns').select('daily_limit').eq('id', campaignId).maybeSingle();
+    return data?.daily_limit || 50;
+  } catch {
+    return 50;
+  }
+}
+
 app.post('/api/send-email', async (req, res) => {
-  const { to, subject, body, accountId, threadId, previousMessageId } = req.body;
+  const { to, subject, body, accountId, threadId, previousMessageId, campaignId, leadAnalysisId, followUpKey } = req.body;
   const authResult = await getOAuthClient(req, res, accountId);
   if (!authResult) return res.status(401).json({ error: 'Not authenticated with Google' });
   const { client, refreshedTokens } = authResult;
   const gmail = google.gmail({ version: 'v1', auth: client });
+  const supabase = getSupabase();
+  let claimed = false;
+  const sentFlagCol = followUpKey ? `${followUpKey}_sent` : null;
 
   try {
+    // Daily quota check — now enforced on every send, not just bulk paths
+    const dailyLimit = campaignId ? await getCampaignDailyLimit(campaignId) : 50;
+    const currentSentToday = await getTodayQuota(accountId || 'primary', campaignId);
+    if (currentSentToday >= dailyLimit) {
+      return res.status(429).json({ error: `Daily sending limit (${dailyLimit}) reached for this account.` });
+    }
+
+    // Follow-up specific: fresh reply/unsubscribe check + atomic claim
+    if (campaignId && leadAnalysisId && sentFlagCol) {
+      const { data: row } = await supabase
+        .from('lead_analysis')
+        .select('id, lead_id')
+        .eq('id', leadAnalysisId)
+        .maybeSingle();
+      if (!row) return res.status(404).json({ error: 'Lead analysis row not found' });
+
+      const { data: replyRow } = await supabase
+        .from('reply_status')
+        .select('has_replied, is_unsubscribed, is_bounced')
+        .eq('lead_id', row.lead_id)
+        .maybeSingle();
+
+      if (replyRow && (replyRow.has_replied || replyRow.is_unsubscribed || replyRow.is_bounced)) {
+        return res.status(409).json({ error: 'Lead has replied, unsubscribed, or bounced since last check. Send skipped.' });
+      }
+
+      const { data: claimRows, error: claimErr } = await supabase
+        .from('lead_analysis')
+        .update({ [sentFlagCol]: true, updated_at: new Date().toISOString() })
+        .eq('id', leadAnalysisId)
+        .eq(sentFlagCol, false)
+        .select();
+
+      if (claimErr || !claimRows || claimRows.length === 0) {
+        return res.status(409).json({ error: 'This follow-up was already sent (claimed by another process).' });
+      }
+      claimed = true;
+    }
+
     let internetMessageId: string | undefined = undefined;
     if (previousMessageId) {
       try {
@@ -2320,7 +2507,17 @@ app.post('/api/send-email', async (req, res) => {
 
     const gmailResponse = await gmail.users.messages.send(sendParams);
     
-    await incrementQuota(accountId || 'primary');
+    await incrementQuota(accountId || 'primary', campaignId);
+
+    if (claimed && leadAnalysisId && followUpKey) {
+      await supabase
+        .from('lead_analysis')
+        .update({
+          [`${followUpKey}_sent_at`]: new Date().toISOString(),
+          last_email_sent_at: new Date().toISOString(),
+        })
+        .eq('id', leadAnalysisId);
+    }
     
     res.json({ 
       success: true, 
@@ -2329,6 +2526,10 @@ app.post('/api/send-email', async (req, res) => {
       threadId: gmailResponse.data.threadId
     });
   } catch (error: any) {
+    // Roll back the optimistic claim if the actual Gmail send failed
+    if (claimed && leadAnalysisId && sentFlagCol) {
+      await supabase.from('lead_analysis').update({ [sentFlagCol]: false }).eq('id', leadAnalysisId).catch(() => {});
+    }
     console.error('[GMAIL SEND] Error sending email:', error);
     if (isAuthError(error)) {
       return res.status(401).json({ error: 'Google session expired or invalid. Please reconnect your Google account.' });
@@ -3061,54 +3262,97 @@ const addBusinessDays = (date: Date, days: number): Date => {
 // ============================================================
 
 app.post('/api/queue-initial-sends', async (req, res) => {
-  const { campaignId, batchSchedule, sendStartDate } = req.body;
+  const { campaignId, batchSchedule, sendStartDate, sendDateRaw, sendTimeRaw } = req.body;
   if (!campaignId || !batchSchedule) {
     return res.status(400).json({ error: 'Missing campaignId or batchSchedule' });
   }
 
-  const supabase = getSupabase();
+  cancelledCampaigns.delete(campaignId);
+
+  // Capture current request's live Google tokens so the background sender has fresh creds
+  const reqTokens = getTokensFromRequest(req);
+  if (reqTokens) {
+    try {
+      const userInfoClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID, process.env.GOOGLE_CLIENT_SECRET);
+      userInfoClient.setCredentials(reqTokens);
+      const gmail = google.gmail({ version: 'v1', auth: userInfoClient });
+      const profile = await gmail.users.getProfile({ userId: 'me' });
+      const email = profile.data.emailAddress;
+      if (email) {
+        await storeAccountTokens(email, reqTokens, true);
+        console.log(`[QUEUE INITIAL] Captured and persisted tokens for ${email}`);
+      }
+    } catch (err: any) {
+      console.warn('[QUEUE INITIAL] Non-critical: failed to capture tokens:', err.message);
+    }
+  }
+
+    const supabase = getSupabase();
   try {
-    const baseDate = sendStartDate ? new Date(sendStartDate) : new Date();
-    console.log(`[QUEUE INITIAL] Queueing campaign ${campaignId} with base date ${baseDate.toISOString()}`);
+    const { data: campaign } = await supabase
+      .from('campaigns')
+      .select('timezone, country')
+      .eq('id', campaignId)
+      .maybeSingle();
+    const campaignTz = campaign?.timezone || TIMEZONE_MAP[campaign?.country || ''] || 'UTC';
+
+    // baseDate: either "send now" (sendStartDate ISO, immediate) or a scheduled
+    // date+time pair that must be interpreted in the campaign's timezone.
+    let baseDate: Date;
+    if (sendDateRaw && sendTimeRaw) {
+      baseDate = zonedTimeToUtc(sendDateRaw, sendTimeRaw, campaignTz);
+    } else {
+      baseDate = sendStartDate ? new Date(sendStartDate) : new Date();
+    }
+
+    console.log(`[QUEUE INITIAL] Queueing campaign ${campaignId} in ${campaignTz}, base date ${baseDate.toISOString()}`);
 
     // Update campaign's batch_schedule record with sendStartDate
     const campaignScheduleObj = {
       batchSchedule,
       currentBatch: 1,
       sendStartDate: baseDate.toISOString(),
+      timezone: campaignTz,
       createdAt: new Date().toISOString(),
     };
     
     // Attempt update to campaigns (fails silently or succeeds)
-    await supabase
+    const { error: campaignUpdateErr } = await supabase
       .from('campaigns')
       .update({ batch_schedule: campaignScheduleObj })
       .eq('id', campaignId);
+    if (campaignUpdateErr) {
+      console.error(`[QUEUE INITIAL] Failed to persist batch_schedule to campaigns table for ${campaignId}:`, campaignUpdateErr);
+    }
+
+    let totalSkipped = 0;
 
     // Schedule each lead's initial email in lead_analysis.batch_status as "queued:<timestamp>"
     for (const batch of batchSchedule) {
       const batchDay = batch.day || 1;
-      const batchTime = batch.time || '09:00';
-      const [hour, minute] = batchTime.split(':').map(Number);
 
-      let scheduledDate = new Date(baseDate);
+      // Get the correct calendar date for this batch day, then apply THIS
+      // batch's own send time, correctly converted for the campaign's timezone.
+      let batchDateOnly = new Date(baseDate);
       if (batchDay > 1) {
-        scheduledDate = addBusinessDays(baseDate, batchDay - 1);
+        batchDateOnly = addBusinessDays(baseDate, batchDay - 1);
       }
-      scheduledDate.setHours(hour, minute, 0, 0);
 
-      // If scheduled time has already passed today for Day 1, schedule it for now
-      if (batchDay === 1 && scheduledDate < new Date()) {
-        scheduledDate = new Date();
+      let scheduledDate: Date;
+      if (batch.time) {
+        // Re-derive the calendar date string in the campaign's timezone, then
+        // apply this batch's specific time via the same zoned conversion.
+        const dateInTz = new Intl.DateTimeFormat('en-CA', { timeZone: campaignTz, year: 'numeric', month: '2-digit', day: '2-digit' }).format(batchDateOnly);
+        scheduledDate = zonedTimeToUtc(dateInTz, batch.time, campaignTz);
+      } else {
+        scheduledDate = batchDateOnly;
       }
 
       const scheduledIso = scheduledDate.toISOString();
-      const leadIds = batch.leads.map((l: any) => l.id);
+      const leadIds = batch.leads.map((l: any) => l.id || l._supabaseId);
 
       if (leadIds.length > 0) {
-        console.log(`[QUEUE INITIAL] Scheduling ${leadIds.length} leads for Day ${batchDay} at ${scheduledIso}`);
-        
-        const { error: updateErr } = await supabase
+        const { data: updatedRows, error: updateErr } = await supabase
           .from('lead_analysis')
           .update({
             batch_status: `queued:${scheduledIso}`,
@@ -3116,15 +3360,22 @@ app.post('/api/queue-initial-sends', async (req, res) => {
             updated_at: new Date().toISOString()
           })
           .eq('campaign_id', campaignId)
-          .in('lead_id', leadIds);
+          .in('lead_id', leadIds)
+          .not('sent_status', 'in', '("sent","sending","unsubscribed","replied")')
+          .select('id');
 
         if (updateErr) {
           console.error(`[QUEUE INITIAL] Error updating lead analysis records for batch ${batchDay}:`, updateErr);
+        } else {
+          const queuedCount = updatedRows?.length || 0;
+          const skippedCount = leadIds.length - queuedCount;
+          totalSkipped += skippedCount;
+          console.log(`[QUEUE INITIAL] Day ${batchDay}: queued ${queuedCount} of ${leadIds.length} leads at ${scheduledIso} (${batch.time || 'default time'} ${campaignTz})${skippedCount > 0 ? `, skipped ${skippedCount} already sent/handled` : ''}`);
         }
       }
     }
 
-    res.json({ success: true, message: `Successfully queued initial emails across ${batchSchedule.length} days.` });
+    res.json({ success: true, message: `Successfully queued initial emails across ${batchSchedule.length} days.`, skipped: totalSkipped });
   } catch (err: any) {
     console.error('[QUEUE INITIAL] Error queueing initial sends:', err);
     res.status(500).json({ error: 'Failed to queue initial sends', message: err.message });
@@ -3139,6 +3390,26 @@ app.post('/api/queue-all-now', async (req, res) => {
   const { campaignId } = req.body;
   if (!campaignId) {
     return res.status(400).json({ error: 'Missing campaignId' });
+  }
+
+  cancelledCampaigns.delete(campaignId);
+
+  // Capture current request's live Google tokens so the background sender has fresh creds
+  const reqTokens = getTokensFromRequest(req);
+  if (reqTokens) {
+    try {
+      const userInfoClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID, process.env.GOOGLE_CLIENT_SECRET);
+      userInfoClient.setCredentials(reqTokens);
+      const gmail = google.gmail({ version: 'v1', auth: userInfoClient });
+      const profile = await gmail.users.getProfile({ userId: 'me' });
+      const email = profile.data.emailAddress;
+      if (email) {
+        await storeAccountTokens(email, reqTokens, true);
+        console.log(`[QUEUE ALL NOW] Captured and persisted tokens for ${email}`);
+      }
+    } catch (err: any) {
+      console.warn('[QUEUE ALL NOW] Non-critical: failed to capture tokens:', err.message);
+    }
   }
 
   const supabase = getSupabase();
@@ -3196,6 +3467,18 @@ app.post('/api/queue-all-now', async (req, res) => {
 });
 
 // ============================================================
+// CANCEL BACKGROUND SEND (ADDITION)
+// ============================================================
+
+app.post('/api/cancel-send', (req, res) => {
+  const { campaignId } = req.body;
+  if (!campaignId) return res.status(400).json({ error: 'Missing campaignId' });
+  cancelledCampaigns.add(campaignId);
+  console.log(`[CANCEL SEND] Cancellation requested for campaign ${campaignId}`);
+  res.json({ success: true });
+});
+
+// ============================================================
 // SEND BATCH NOW (ADDITION)
 // ============================================================
 
@@ -3203,6 +3486,27 @@ app.post('/api/send-batch-now', async (req, res) => {
   const { campaignId, leadIds } = req.body;
   if (!campaignId || !leadIds || !Array.isArray(leadIds)) {
     return res.status(400).json({ error: 'Missing campaignId or leadIds array' });
+  }
+
+  cancelledCampaigns.delete(campaignId);
+
+  // Capture current request tokens proactively to make them available to background worker
+  const reqTokens = getTokensFromRequest(req);
+  if (reqTokens) {
+    try {
+      const userInfoClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID, process.env.GOOGLE_CLIENT_SECRET);
+      userInfoClient.setCredentials(reqTokens);
+      const gmail = google.gmail({ version: 'v1', auth: userInfoClient });
+      const profile = await gmail.users.getProfile({ userId: 'me' });
+      const email = profile.data.emailAddress;
+      if (email) {
+        additionalAccounts[email] = reqTokens;
+        saveAccountsToFallbackFile();
+        console.log(`[SEND BATCH NOW] Dynamically captured and stored Google tokens for ${email} from current request.`);
+      }
+    } catch (err: any) {
+      console.warn('[SEND BATCH NOW] Non-critical: Failed to dynamically capture current request tokens:', err.message);
+    }
   }
 
   // Acknowledge receipt and run in the background
@@ -3268,6 +3572,24 @@ app.post('/api/send-batch-now', async (req, res) => {
         return;
       }
 
+      // To prevent duplicate sends due to multiple database rows for the same lead,
+      // we query all analysis rows for this campaign to see if any row for a lead is already marked sent.
+      const { data: allCampaignAnalysis } = await supabase
+        .from('lead_analysis')
+        .select('lead_id, sent_status')
+        .eq('campaign_id', campaignId);
+
+      const globallySentLeadIds = new Set<string>();
+      if (allCampaignAnalysis) {
+        for (const row of allCampaignAnalysis) {
+          if (row.sent_status === 'sent' || row.sent_status === 'unsubscribed') {
+            globallySentLeadIds.add(row.lead_id);
+          }
+        }
+      }
+
+      const processedLeadIds = new Set<string>();
+
       const { data: replyStatuses } = await supabase
         .from('reply_status')
         .select('*')
@@ -3275,15 +3597,7 @@ app.post('/api/send-batch-now', async (req, res) => {
 
       const replyStatusMap = new Map((replyStatuses || []).map(r => [r.lead_id, r]));
 
-      const todayStr = new Date().toISOString().split('T')[0];
-      const { data: quotaRow } = await supabase
-        .from('quota')
-        .select('count')
-        .eq('account_email', senderEmail)
-        .eq('date', todayStr)
-        .single();
-
-      let currentSentToday = quotaRow?.count || 0;
+      let currentSentToday = await getTodayQuota(senderEmail, campaignId);
       const dailyLimit = campaign.daily_limit || 50;
 
       let remainingQuota = dailyLimit - currentSentToday;
@@ -3291,6 +3605,10 @@ app.post('/api/send-batch-now', async (req, res) => {
       let totalSentInBatch = 0;
 
       for (let i = 0; i < analysisRows.length; i++) {
+        if (cancelledCampaigns.has(campaignId)) {
+          console.log(`[SEND BATCH NOW] Cancelled by user for campaign ${campaignId}. Stopping.`);
+          break;
+        }
         if (remainingQuota <= 0) {
           console.warn('[SEND BATCH NOW] Daily limit reached mid-batch. Stopping.');
           break;
@@ -3302,11 +3620,36 @@ app.post('/api/send-batch-now', async (req, res) => {
 
         const repStatus = replyStatusMap.get(a.lead_id);
         const hasReplied = repStatus?.has_replied === true || repStatus?.unsubscribed === true;
-        if (hasReplied || a.sent_status === 'sent' || a.sent_status === 'unsubscribed') {
+        
+        // If the lead has replied, unsubscribed, already been sent in this campaign, or processed earlier in this batch,
+        // mark this redundant analysis row as 'sent' (since the campaign goal for this lead is met/processed) and skip.
+        if (hasReplied || a.sent_status === 'sent' || a.sent_status === 'unsubscribed' || globallySentLeadIds.has(a.lead_id) || processedLeadIds.has(a.lead_id)) {
+          console.log(`[SEND BATCH NOW] Lead ${lead.company} already processed or sent. Marking row ${a.id} as sent and skipping.`);
+          const targetSentStatus = (repStatus?.unsubscribed === true || a.sent_status === 'unsubscribed') ? 'unsubscribed' : 'sent';
           await supabase
             .from('lead_analysis')
-            .update({ batch_status: 'sent', updated_at: new Date().toISOString() })
+            .update({ 
+              batch_status: 'sent', 
+              sent_status: targetSentStatus, 
+              updated_at: new Date().toISOString() 
+            })
             .eq('id', a.id);
+          continue;
+        }
+
+        // Track that we are processing this lead in this batch run
+        processedLeadIds.add(a.lead_id);
+
+        // ATOMIC CLAIM
+        const { data: claimedRows, error: claimError } = await supabase
+          .from('lead_analysis')
+          .update({ sent_status: 'sending', updated_at: new Date().toISOString() })
+          .eq('id', a.id)
+          .not('sent_status', 'in', '("sent","sending","unsubscribed")')
+          .select();
+
+        if (claimError || !claimedRows || claimedRows.length === 0) {
+          console.log(`[SEND BATCH NOW] Lead ${lead.company} already claimed elsewhere. Skipping.`);
           continue;
         }
 
@@ -3328,6 +3671,7 @@ app.post('/api/send-batch-now', async (req, res) => {
           await spacingDelay(delayMs);
         }
 
+        let gmailResponse;
         try {
           const utf8Subject = `=?utf-8?B?${Buffer.from(emailSubject).toString('base64')}?=`;
           const emailHtml = formatEmailAsHTML(emailBody, 'Adesina', false, lead.email);
@@ -3347,13 +3691,32 @@ app.post('/api/send-batch-now', async (req, res) => {
 
           const encodedMessage = Buffer.from(rawMessage).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
           
-          const gmailResponse = await gmail.users.messages.send({
+          gmailResponse = await gmail.users.messages.send({
             userId: 'me',
             requestBody: {
               raw: encodedMessage
             }
           });
+        } catch (sendErr: any) {
+          console.error(`[SEND BATCH NOW] Failed to send email via Gmail to ${lead.company}:`, sendErr);
+          try {
+            await supabase
+              .from('lead_analysis')
+              .update({
+                sent_status: 'failed',
+                batch_status: 'failed',
+                error_reason: sendErr.message || String(sendErr),
+                updated_at: new Date().toISOString()
+              })
+              .eq('id', a.id);
+          } catch (dbErr: any) {
+            console.error('[SEND BATCH NOW] Failed to write failed status to DB:', dbErr.message || dbErr);
+          }
+          continue; // Move on to next lead
+        }
 
+        // If we reach here, Gmail send succeeded! We MUST record it as sent in lead_analysis.
+        try {
           await supabase
             .from('lead_analysis')
             .update({
@@ -3367,34 +3730,22 @@ app.post('/api/send-batch-now', async (req, res) => {
             })
             .eq('id', a.id);
 
-          const { data: campaignData } = await supabase
-            .from('campaigns')
-            .select('sent_count')
-            .eq('id', campaign.id)
-            .single();
-          const currentSentCount = campaignData?.sent_count || 0;
-          await supabase
-            .from('campaigns')
-            .update({ sent_count: currentSentCount + 1 })
-            .eq('id', campaign.id);
-
-          await incrementQuota(senderEmail);
-
           totalSentInBatch++;
           remainingQuota--;
           console.log(`[SEND BATCH NOW] ✓ Successfully sent initial email to ${lead.company}`);
+        } catch (dbErr: any) {
+          console.error(`[SEND BATCH NOW] Gmail succeeded but database update failed for ${lead.company}:`, dbErr.message || dbErr);
+          // Still increment counts since the email was sent
+          totalSentInBatch++;
+          remainingQuota--;
+        }
 
-        } catch (sendErr: any) {
-          console.error(`[SEND BATCH NOW] Failed to send email to ${lead.company}:`, sendErr);
-          await supabase
-            .from('lead_analysis')
-            .update({
-              sent_status: 'failed',
-              batch_status: 'failed',
-              error_reason: sendErr.message || String(sendErr),
-              updated_at: new Date().toISOString()
-            })
-            .eq('id', a.id);
+        // Perform non-blocking auxiliary updates
+        try {
+          await incrementCampaignCounter('increment_campaign_sent_count', campaign.id, 'sent_count');
+          await incrementQuota(senderEmail, campaign.id);
+        } catch (auxErr: any) {
+          console.warn(`[SEND BATCH NOW] Non-critical aux updates failed for ${lead.company}:`, auxErr.message || auxErr);
         }
       }
       
@@ -3409,7 +3760,30 @@ app.post('/api/send-batch-now', async (req, res) => {
 // BACKGROUND INITIAL EMAIL SENDER (ADDITION)
 // ============================================================
 
+async function releaseStaleClaims(campaignId?: string) {
+  const supabase = getSupabase();
+  // 20 min, not tied to cron interval — must exceed the longest realistic
+  // single-run duration (batch size × per-email spacing + API latency)
+  const staleThreshold = new Date(Date.now() - 20 * 60 * 1000).toISOString();
+
+  let query = supabase
+    .from('lead_analysis')
+    .update({ sent_status: 'not-sent', updated_at: new Date().toISOString() })
+    .eq('sent_status', 'sending')
+    .lt('updated_at', staleThreshold);
+
+  if (campaignId) query = query.eq('campaign_id', campaignId);
+
+  const { data, error } = await query.select('id');
+  if (error) {
+    console.error('[STALE CLAIM] Failed to release stuck rows:', error);
+  } else if (data && data.length > 0) {
+    console.log(`[STALE CLAIM] Released ${data.length} rows stuck in 'sending' for >20min`);
+  }
+}
+
 async function processDueInitialEmails(campaignId?: string, forceWindow = false) {
+  await releaseStaleClaims(campaignId);
   const supabase = getSupabase();
   
   let query = supabase.from('campaigns').select('*');
@@ -3427,22 +3801,6 @@ async function processDueInitialEmails(campaignId?: string, forceWindow = false)
   let totalSent = 0;
   
   for (const campaign of campaigns) {
-    if (!forceWindow) {
-      const startTime = campaign.schedule_start_time || '09:00';
-      const endTime = campaign.schedule_end_time || '17:00';
-      const [startHour, startMinute] = startTime.split(':').map(Number);
-      const [endHour, endMinute] = endTime.split(':').map(Number);
-      
-      const startTimeToday = new Date();
-      startTimeToday.setHours(startHour, startMinute, 0, 0);
-      const endTimeToday = new Date();
-      endTimeToday.setHours(endHour, endMinute, 0, 0);
-      
-      if (now < startTimeToday || now > endTimeToday) {
-        continue;
-      }
-    }
-
     let senderEmail = campaign.sender_account_id;
     if (!senderEmail || senderEmail === 'primary') {
       senderEmail = await getPrimaryAccountEmail();
@@ -3452,12 +3810,12 @@ async function processDueInitialEmails(campaignId?: string, forceWindow = false)
       continue;
     }
 
-    // Fetch queued analysis records for this campaign
+    // Fetch queued analysis records for this campaign (matches both 'queued' and 'queued:<timestamp>')
     const { data: analysisRows, error: analysisError } = await supabase
       .from('lead_analysis')
       .select('*')
       .eq('campaign_id', campaign.id)
-      .like('batch_status', 'queued:%');
+      .like('batch_status', 'queued%');
 
     if (analysisError || !analysisRows || analysisRows.length === 0) {
       continue;
@@ -3465,8 +3823,9 @@ async function processDueInitialEmails(campaignId?: string, forceWindow = false)
 
     // Filter leads that are actually due
     const dueLeadsAnalysis = analysisRows.filter(a => {
+      if (!a.batch_status) return false;
       const parts = a.batch_status.split(':');
-      if (parts.length < 2) return false;
+      if (parts.length < 2) return false; // require an explicit scheduled timestamp
       const scheduledTimeStr = parts.slice(1).join(':');
       const scheduledTime = new Date(scheduledTimeStr);
       return now >= scheduledTime;
@@ -3477,6 +3836,24 @@ async function processDueInitialEmails(campaignId?: string, forceWindow = false)
     }
 
     console.log(`[CRON INITIAL] Found ${dueLeadsAnalysis.length} due initial emails for campaign ${campaign.name}`);
+
+    // To prevent duplicate sends due to multiple database rows for the same lead,
+    // we query all analysis rows for this campaign to see if any row for a lead is already marked sent.
+    const { data: allCampaignAnalysis } = await supabase
+      .from('lead_analysis')
+      .select('lead_id, sent_status')
+      .eq('campaign_id', campaign.id);
+
+    const globallySentLeadIds = new Set<string>();
+    if (allCampaignAnalysis) {
+      for (const row of allCampaignAnalysis) {
+        if (row.sent_status === 'sent' || row.sent_status === 'unsubscribed') {
+          globallySentLeadIds.add(row.lead_id);
+        }
+      }
+    }
+
+    const processedLeadIds = new Set<string>();
 
     // Authenticate OAuth client
     const client = await getOAuthClientByEmail(senderEmail);
@@ -3510,15 +3887,7 @@ async function processDueInitialEmails(campaignId?: string, forceWindow = false)
     const replyStatusMap = new Map((replyStatuses || []).map(r => [r.lead_id, r]));
 
     // Check daily quota limit
-    const todayStr = now.toISOString().split('T')[0];
-    const { data: quotaRow } = await supabase
-      .from('quota')
-      .select('count')
-      .eq('account_email', senderEmail)
-      .eq('date', todayStr)
-      .single();
-
-    const currentSentToday = quotaRow?.count || 0;
+    const currentSentToday = await getTodayQuota(senderEmail, campaign.id);
     const dailyLimit = campaign.daily_limit || 50;
 
     if (currentSentToday >= dailyLimit) {
@@ -3530,6 +3899,10 @@ async function processDueInitialEmails(campaignId?: string, forceWindow = false)
     const spacingDelay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
     for (let i = 0; i < dueLeadsAnalysis.length; i++) {
+      if (cancelledCampaigns.has(campaign.id)) {
+        console.log(`[CRON INITIAL] Cancelled by user for campaign ${campaign.id}. Stopping.`);
+        break;
+      }
       if (remainingQuota <= 0) {
         console.log('[CRON INITIAL] Daily quota reached during run. Stopping.');
         break;
@@ -3545,11 +3918,36 @@ async function processDueInitialEmails(campaignId?: string, forceWindow = false)
       // Check reply status
       const repStatus = replyStatusMap.get(a.lead_id);
       const hasReplied = repStatus?.has_replied === true || repStatus?.unsubscribed === true;
-      if (hasReplied || a.sent_status === 'sent' || a.sent_status === 'unsubscribed') {
+      
+      // If the lead has replied, unsubscribed, already been sent in this campaign, or processed earlier in this batch,
+      // mark this redundant analysis row as 'sent' (since the campaign goal for this lead is met/processed) and skip.
+      if (hasReplied || a.sent_status === 'sent' || a.sent_status === 'unsubscribed' || globallySentLeadIds.has(a.lead_id) || processedLeadIds.has(a.lead_id)) {
+        console.log(`[CRON INITIAL] Lead ${lead.company} already processed or sent. Marking row ${a.id} as sent and skipping.`);
+        const targetSentStatus = (repStatus?.unsubscribed === true || a.sent_status === 'unsubscribed') ? 'unsubscribed' : 'sent';
         await supabase
           .from('lead_analysis')
-          .update({ batch_status: 'sent', updated_at: new Date().toISOString() })
+          .update({ 
+            batch_status: 'sent', 
+            sent_status: targetSentStatus, 
+            updated_at: new Date().toISOString() 
+          })
           .eq('id', a.id);
+        continue;
+      }
+
+      // Track that we are processing this lead in this cron run
+      processedLeadIds.add(a.lead_id);
+
+      // ATOMIC CLAIM — only proceed if no other process has already claimed/sent this row
+      const { data: claimedRows, error: claimError } = await supabase
+        .from('lead_analysis')
+        .update({ sent_status: 'sending', updated_at: new Date().toISOString() })
+        .eq('id', a.id)
+        .not('sent_status', 'in', '("sent","sending","unsubscribed")')
+        .select();
+
+      if (claimError || !claimedRows || claimedRows.length === 0) {
+        console.log(`[CRON INITIAL] Lead ${lead.company} already claimed by another run. Skipping.`);
         continue;
       }
 
@@ -3573,6 +3971,7 @@ async function processDueInitialEmails(campaignId?: string, forceWindow = false)
         await spacingDelay(delayMs);
       }
 
+      let gmailResponse;
       try {
         const utf8Subject = `=?utf-8?B?${Buffer.from(emailSubject).toString('base64')}?=`;
         const emailHtml = formatEmailAsHTML(emailBody, 'Adesina', false, lead.email);
@@ -3592,14 +3991,33 @@ async function processDueInitialEmails(campaignId?: string, forceWindow = false)
 
         const encodedMessage = Buffer.from(rawMessage).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
         
-        const gmailResponse = await gmail.users.messages.send({
+        gmailResponse = await gmail.users.messages.send({
           userId: 'me',
           requestBody: {
             raw: encodedMessage
           }
         });
+      } catch (sendErr: any) {
+        console.error(`[CRON INITIAL] Failed to send email via Gmail to ${lead.company}:`, sendErr);
+        try {
+          await supabase
+            .from('lead_analysis')
+            .update({
+              sent_status: 'failed',
+              batch_status: 'failed',
+              error_reason: sendErr.message || String(sendErr),
+              updated_at: new Date().toISOString()
+            })
+            .eq('id', a.id);
+        } catch (dbErr: any) {
+          console.error('[CRON INITIAL] Failed to write failed status to DB:', dbErr.message || dbErr);
+        }
+        results.push({ lead: lead.company, email: lead.email, success: false, error: sendErr.message || String(sendErr) });
+        continue; // Move on to next lead
+      }
 
-        // Update database rows
+      // If we reach here, Gmail send succeeded! We MUST record it as sent.
+      try {
         await supabase
           .from('lead_analysis')
           .update({
@@ -3613,40 +4031,25 @@ async function processDueInitialEmails(campaignId?: string, forceWindow = false)
           })
           .eq('id', a.id);
 
-        // Fetch and update campaign sent count
-        const { data: campaignData } = await supabase
-          .from('campaigns')
-          .select('sent_count')
-          .eq('id', campaign.id)
-          .single();
-        const currentSentCount = campaignData?.sent_count || 0;
-        await supabase
-          .from('campaigns')
-          .update({ sent_count: currentSentCount + 1 })
-          .eq('id', campaign.id);
-
-        await incrementQuota(senderEmail);
-
         totalSent++;
         remainingQuota--;
 
         results.push({ lead: lead.company, email: lead.email, success: true });
         console.log(`[CRON INITIAL] ✓ Sent initial email to ${lead.company}`);
+      } catch (dbErr: any) {
+        console.error(`[CRON INITIAL] Gmail succeeded but database update failed for ${lead.company}:`, dbErr.message || dbErr);
+        // Still increment counts since the email was sent
+        totalSent++;
+        remainingQuota--;
+        results.push({ lead: lead.company, email: lead.email, success: true, warning: 'Sent but failed to update database' });
+      }
 
-      } catch (sendErr: any) {
-        console.error(`[CRON INITIAL] Failed to send email to ${lead.company}:`, sendErr);
-        
-        await supabase
-          .from('lead_analysis')
-          .update({
-            sent_status: 'failed',
-            batch_status: 'failed',
-            error_reason: sendErr.message || String(sendErr),
-            updated_at: new Date().toISOString()
-          })
-          .eq('id', a.id);
-
-        results.push({ lead: lead.company, email: lead.email, success: false, error: sendErr.message || String(sendErr) });
+      // Perform non-blocking auxiliary updates
+      try {
+        await incrementCampaignCounter('increment_campaign_sent_count', campaign.id, 'sent_count');
+        await incrementQuota(senderEmail, campaign.id);
+      } catch (auxErr: any) {
+        console.warn(`[CRON INITIAL] Non-critical aux updates failed for ${lead.company}:`, auxErr.message || auxErr);
       }
     }
   }
@@ -3660,20 +4063,6 @@ async function processDueInitialEmails(campaignId?: string, forceWindow = false)
 
 app.post('/api/calculate-schedule', async (req, res) => {
   const { startDate, country, timezone, campaignId, scheduleStartTime, scheduleEndTime, followUp1Days, followUp2Days, followUp3Days } = req.body;
-
-  const TIMEZONE_MAP: Record<string, string> = {
-    'United Kingdom': 'Europe/London',
-    'United States': 'America/New_York',
-    'Nigeria': 'Africa/Lagos',
-    'Canada': 'America/Toronto',
-    'Australia': 'Australia/Sydney',
-    'South Africa': 'Africa/Johannesburg',
-    'Ghana': 'Africa/Accra',
-    'Kenya': 'Africa/Nairobi',
-    'India': 'Asia/Kolkata',
-    'Germany': 'Europe/Berlin',
-    'France': 'Europe/Paris',
-  };
 
   const tz = timezone || TIMEZONE_MAP[country] || 'America/New_York';
 
@@ -3818,7 +4207,38 @@ function generateUUID() {
   });
 }
 
+async function incrementCampaignCounter(
+  rpcName: string,
+  campaignId: string,
+  fallbackColumn: 'sent_count' | 'reply_count'
+) {
+  const supabase = getSupabase();
+  const { error: rpcErr } = await supabase.rpc(rpcName, { campaign_id: campaignId });
+  if (!rpcErr) return;
+
+  try {
+    const { data: campaignData } = await supabase
+      .from('campaigns')
+      .select(fallbackColumn)
+      .eq('id', campaignId)
+      .single();
+    const current = (campaignData as any)?.[fallbackColumn] || 0;
+    await supabase
+      .from('campaigns')
+      .update({ [fallbackColumn]: current + 1 })
+      .eq('id', campaignId);
+  } catch (fallbackErr: any) {
+    console.warn(`[COUNTER] Failed to increment ${fallbackColumn} for ${campaignId}:`, fallbackErr.message || fallbackErr);
+  }
+}
+
 async function getPrimaryAccountEmail(): Promise<string | null> {
+  // Check in-memory fallback first
+  const keys = Object.keys(additionalAccounts);
+  if (keys.length > 0) {
+    return keys[0];
+  }
+
   const { data, error } = await getSupabase()
     .from('gmail_accounts')
     .select('email')
@@ -3837,18 +4257,22 @@ async function getPrimaryAccountEmail(): Promise<string | null> {
 }
 
 async function getOAuthClientByEmail(email: string) {
-  const { data, error } = await getSupabase()
-    .from('gmail_accounts')
-    .select('tokens')
-    .eq('email', email)
-    .single();
+  let tokens = additionalAccounts[email];
 
-  if (error || !data || !data.tokens) {
-    console.error(`[CRON AUTH] Failed to retrieve tokens for ${email}:`, error);
-    return null;
+  if (!tokens) {
+    const { data, error } = await getSupabase()
+      .from('gmail_accounts')
+      .select('tokens')
+      .eq('email', email)
+      .single();
+
+    if (error || !data || !data.tokens) {
+      console.error(`[CRON AUTH] Failed to retrieve tokens for ${email}:`, error);
+      return null;
+    }
+    tokens = data.tokens;
   }
 
-  const tokens = data.tokens;
   const client = new OAuth2Client(process.env.GOOGLE_CLIENT_ID, process.env.GOOGLE_CLIENT_SECRET);
   client.setCredentials(tokens);
 
@@ -3859,6 +4283,9 @@ async function getOAuthClientByEmail(email: string) {
       const { credentials } = await client.refreshAccessToken();
       const refreshed = { ...tokens, ...credentials };
       
+      // Update in-memory fallback
+      additionalAccounts[email] = refreshed;
+
       const { error: updateError } = await getSupabase()
         .from('gmail_accounts')
         .update({ tokens: refreshed, updated_at: new Date().toISOString() })
@@ -3866,10 +4293,6 @@ async function getOAuthClientByEmail(email: string) {
         
       if (updateError) {
         console.error(`[CRON AUTH] Failed to save refreshed tokens for ${email}:`, updateError);
-      } else {
-        if (additionalAccounts[email]) {
-          additionalAccounts[email] = refreshed;
-        }
       }
       
       client.setCredentials(refreshed);
@@ -3932,18 +4355,16 @@ function buildThreadedRawEmail({
   return Buffer.from(rawMessage).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
-async function serverSideCheckReplies(gmail: any, threadId: string): Promise<boolean> {
+async function serverSideCheckReplies(gmail: any, threadId: string, myEmail: string): Promise<boolean> {
   if (!threadId) return false;
   try {
     const thread = await gmail.users.threads.get({ userId: 'me', id: threadId });
     const messages = thread.data.messages || [];
     if (messages.length > 1) {
-      const profile = await gmail.users.getProfile({ userId: 'me' });
-      const myEmail = (profile.data.emailAddress || '').toLowerCase();
       for (const msg of messages) {
         const headers = msg.payload?.headers || [];
         const fromHeader = (headers.find(h => h.name?.toLowerCase() === 'from')?.value || '').toLowerCase();
-        if (fromHeader && !fromHeader.includes(myEmail)) {
+        if (fromHeader && !fromHeader.includes(myEmail.toLowerCase())) {
           console.log(`[REPLY DETECTED] Found message from ${fromHeader} in thread ${threadId}`);
           return true;
         }
@@ -3956,6 +4377,7 @@ async function serverSideCheckReplies(gmail: any, threadId: string): Promise<boo
 }
 
 async function processDueFollowups(campaignId?: string, forceWindow = false) {
+  await releaseStaleClaims(campaignId);
   console.log(`[CRON] Starting processDueFollowups... Campaign ID filter: ${campaignId || 'All'}`);
   const supabase = getSupabase();
   
@@ -3980,16 +4402,10 @@ async function processDueFollowups(campaignId?: string, forceWindow = false) {
     if (!forceWindow) {
       const startTime = campaign.follow_up_start_time || '14:00';
       const endTime = campaign.follow_up_end_time || '16:00';
-      const [startHour, startMinute] = startTime.split(':').map(Number);
-      const [endHour, endMinute] = endTime.split(':').map(Number);
-      
-      const startTimeToday = new Date();
-      startTimeToday.setHours(startHour, startMinute, 0, 0);
-      const endTimeToday = new Date();
-      endTimeToday.setHours(endHour, endMinute, 0, 0);
-      
-      if (now < startTimeToday || now > endTimeToday) {
-        console.log(`[CRON] Campaign ${campaign.name} is outside follow-up window (${startTime} - ${endTime}). Skipping.`);
+      const tz = getCampaignTimezone(campaign);
+
+      if (!isWithinWindow(startTime, endTime, tz, now)) {
+        console.log(`[CRON] Campaign ${campaign.name} is outside follow-up window (${startTime}-${endTime} ${tz}). Skipping.`);
         continue;
       }
     }
@@ -4070,7 +4486,7 @@ async function processDueFollowups(campaignId?: string, forceWindow = false) {
       }
 
       if (a.initial_thread_id) {
-        const replied = await serverSideCheckReplies(gmail, a.initial_thread_id);
+        const replied = await serverSideCheckReplies(gmail, a.initial_thread_id, senderEmail);
         if (replied) {
           console.log(`[CRON] Lead ${lead.company} has replied! Updating status.`);
           const existingRS = replyStatusMap.get(lead.id);
@@ -4084,11 +4500,7 @@ async function processDueFollowups(campaignId?: string, forceWindow = false) {
             last_checked: new Date().toISOString(),
           }, { onConflict: 'lead_id' });
           
-          await supabase.rpc('increment_campaign_replies', { campaign_id: campaign.id }).catch(() => {
-            supabase.from('campaigns')
-              .update({ reply_count: (campaign.reply_count || 0) + 1 })
-              .eq('id', campaign.id);
-          });
+          await incrementCampaignCounter('increment_campaign_replies', campaign.id, 'reply_count');
 
           await supabase.from('lead_analysis')
             .update({ sent_status: 'replied', updated_at: new Date().toISOString() })
@@ -4127,6 +4539,13 @@ async function processDueFollowups(campaignId?: string, forceWindow = false) {
       let emailBody = a[followUpKey] || a.ai_analysis?.[followUpKey];
       if (!emailBody) {
         console.warn(`[CRON] No follow-up template body for ${lead.company} on key ${followUpKey}`);
+        await supabase
+          .from('lead_analysis')
+          .update({
+            error_reason: `Missing ${followUpKey} content — regenerate emails for this lead`,
+            updated_at: new Date().toISOString(),
+          })
+          .eq('id', a.id);
         continue;
       }
 
@@ -4161,6 +4580,10 @@ async function processDueFollowups(campaignId?: string, forceWindow = false) {
       const endTime = new Date(Date.now() + remainingMs);
 
       for (let i = 0; i < dueLeads.length; i++) {
+        if (cancelledCampaigns.has(campaign.id)) {
+          console.log(`[CRON FOLLOWUP] Cancelled by user for campaign ${campaign.id}. Stopping.`);
+          break;
+        }
         const { lead, analysis: a, followUpKey, daysLabel, isFollowUp1, isFollowUp2, isFollowUp3, emailBody } = dueLeads[i];
         
         // Re-verify reply/unsubscribe status before sending to prevent duplicates / sending to replied leads
@@ -4225,7 +4648,7 @@ async function processDueFollowups(campaignId?: string, forceWindow = false) {
             }
           });
 
-          await incrementQuota(senderEmail);
+          await incrementQuota(senderEmail, campaign.id);
 
           const updates: any = {
             last_email_sent_at: new Date().toISOString(),
@@ -4314,12 +4737,91 @@ app.all('/api/cron/send-initial', (req, res) => {
 });
 
 // ============================================================
+// DATABASE DEDUPLICATION ON STARTUP (ADDITION)
+// ============================================================
+
+async function cleanDuplicateLeadAnalysis() {
+  const supabase = getSupabase();
+  try {
+    console.log('[DEDUPLICATE] Running lead_analysis deduplication check...');
+    const { data, error } = await supabase
+      .from('lead_analysis')
+      .select('id, lead_id, campaign_id, sent_status, batch_status, updated_at');
+    
+    if (error || !data) {
+      console.error('[DEDUPLICATE] Failed to fetch lead_analysis rows:', error);
+      return;
+    }
+
+    // Group by campaign_id + lead_id
+    const groups = new Map<string, any[]>();
+    for (const row of data) {
+      if (!row.lead_id || !row.campaign_id) continue;
+      const key = `${row.campaign_id}:${row.lead_id}`;
+      if (!groups.has(key)) {
+        groups.set(key, []);
+      }
+      groups.get(key)!.push(row);
+    }
+
+    let deletedCount = 0;
+    for (const [key, rows] of groups.entries()) {
+      if (rows.length <= 1) continue;
+
+      // Sort rows so the "best" or "most active" row is first.
+      // Rules:
+      // 1. Row with sent_status = 'sent' or 'replied' or 'unsubscribed' is better than 'failed' or 'not-sent'
+      // 2. If same sent_status, row with latest updated_at is better
+      rows.sort((r1, r2) => {
+        const score = (r: any) => {
+          if (r.sent_status === 'sent') return 10;
+          if (r.sent_status === 'replied') return 10;
+          if (r.sent_status === 'unsubscribed') return 10;
+          if (r.sent_status === 'sending') return 5;
+          if (r.sent_status === 'failed') return 1;
+          return 0;
+        };
+        const s1 = score(r1);
+        const s2 = score(r2);
+        if (s1 !== s2) return s2 - s1; // Descending
+        return new Date(r2.updated_at).getTime() - new Date(r1.updated_at).getTime(); // Descending
+      });
+
+      // Keep the first row, delete the rest
+      const [keepRow, ...duplicateRows] = rows;
+      const idsToDelete = duplicateRows.map(r => r.id);
+      
+      console.log(`[DEDUPLICATE] Duplicate found for campaign-lead: ${key}. Keeping ${keepRow.id} (sent_status: ${keepRow.sent_status}), deleting ${idsToDelete.length} duplicates.`);
+      
+      const { error: delError } = await supabase
+        .from('lead_analysis')
+        .delete()
+        .in('id', idsToDelete);
+      
+      if (delError) {
+        console.error(`[DEDUPLICATE] Failed to delete duplicates for ${key}:`, delError);
+      } else {
+        deletedCount += idsToDelete.length;
+      }
+    }
+    console.log(`[DEDUPLICATE] Completed lead_analysis deduplication. Deleted ${deletedCount} duplicate rows.`);
+  } catch (err) {
+    console.error('[DEDUPLICATE] Unexpected error during deduplication:', err);
+  }
+}
+
+// ============================================================
 // SERVER START
 // ============================================================
 
 async function startServer() {
   const isProd = process.env.NODE_ENV === 'production';
   console.log(`Starting Selio server in ${isProd ? 'production' : 'development'} mode...`);
+
+  // Run duplicate row cleanup
+  await cleanDuplicateLeadAnalysis().catch(err => {
+    console.error('[STARTUP] Duplicate cleanup failed:', err);
+  });
 
   // Required environment variables startup check
   const hasSupabaseUrl = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL;
@@ -4333,6 +4835,22 @@ async function startServer() {
     console.log(`[ACCOUNTS] Loaded ${Object.keys(additionalAccounts).length} additional accounts from Supabase.`);
   } catch (err: any) {
     console.warn('[ACCOUNTS] Note: Failed to load additional accounts on startup:', err.message || err);
+  }
+
+  // Automatic database cleanup on startup for stuck 'sending' states
+  try {
+    const supabase = getSupabase();
+    const { error: resetError } = await supabase
+      .from('lead_analysis')
+      .update({ sent_status: 'not-sent', updated_at: new Date().toISOString() })
+      .eq('sent_status', 'sending');
+    if (resetError) {
+      console.warn('[STARTUP] Note: Could not reset stuck sending statuses:', resetError.message);
+    } else {
+      console.log('[STARTUP] Cleaned up stuck sending statuses from database.');
+    }
+  } catch (err: any) {
+    console.warn('[STARTUP] Note: Failed to perform database cleanup on startup:', err.message || err);
   }
 
   if (!isProd) {
@@ -4353,50 +4871,35 @@ async function startServer() {
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`Selio server running on http://0.0.0.0:${PORT}`);
     
-    // Register background hourly job
-    console.log('[BG CRON] Registering hourly background follow-up job interval...');
-    let isProcessing = false;
-    setInterval(() => {
-      if (isProcessing) {
-        console.log('[BG CRON] Previous run still in progress, skipping execution.');
-        return;
-      }
-      isProcessing = true;
-      console.log('[BG CRON] Running scheduled hourly background follow-ups check...');
-      processDueFollowups()
-        .then(result => {
-          console.log('[BG CRON] Background hourly job execution completed:', result);
-        })
-        .catch(err => {
-          console.error('[BG CRON] Background hourly job execution failed:', err);
-        })
-        .finally(() => {
-          isProcessing = false;
-        });
-    }, 60 * 60 * 1000);
+    const useInternalCron = process.env.USE_INTERNAL_CRON !== 'false'; // default: on
 
-    // Register background 1-minute job for scheduled initial sends
-    console.log('[BG CRON] Registering 1-minute background initial email job interval...');
-    let isProcessingInitial = false;
-    setInterval(() => {
-      if (isProcessingInitial) {
-        console.log('[BG CRON INITIAL] Previous run still in progress, skipping execution.');
-        return;
-      }
-      isProcessingInitial = true;
-      processDueInitialEmails()
-        .then(result => {
-          if (result && result.totalSent && result.totalSent > 0) {
-            console.log('[BG CRON INITIAL] Background initial email job execution completed:', result);
-          }
-        })
-        .catch(err => {
-          console.error('[BG CRON INITIAL] Background initial email job execution failed:', err);
-        })
-        .finally(() => {
-          isProcessingInitial = false;
-        });
-    }, 60 * 1000); // 1 minute
+    if (useInternalCron) {
+      console.log('[BG CRON] Internal in-process cron ENABLED (set USE_INTERNAL_CRON=false to disable).');
+
+      let isProcessing = false;
+      setInterval(() => {
+        if (isProcessing) return;
+        isProcessing = true;
+        processDueFollowups()
+          .then(result => console.log('[BG CRON] Hourly follow-up job complete:', result))
+          .catch(err => console.error('[BG CRON] Hourly follow-up job failed:', err))
+          .finally(() => { isProcessing = false; });
+      }, 60 * 60 * 1000);
+
+      let isProcessingInitial = false;
+      setInterval(() => {
+        if (isProcessingInitial) return;
+        isProcessingInitial = true;
+        processDueInitialEmails()
+          .then(result => {
+            if (result?.totalSent > 0) console.log('[BG CRON INITIAL] Job complete:', result);
+          })
+          .catch(err => console.error('[BG CRON INITIAL] Job failed:', err))
+          .finally(() => { isProcessingInitial = false; });
+      }, 60 * 1000);
+    } else {
+      console.log('[BG CRON] Internal cron DISABLED — relying on external cron for /api/cron/* endpoints.');
+    }
   });
 }
 
