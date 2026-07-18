@@ -765,6 +765,7 @@ export default function SEOAutomation() {
 
   // Create Campaign Modal state
   const [showCreateCampaignModal, setShowCreateCampaignModal] = useState(false);
+  const [newCampaignSenderAccountId, setNewCampaignSenderAccountId] = useState('');
   const [newCampaignName, setNewCampaignName] = useState('');
   const [newCampaignCountry, setNewCampaignCountry] = useState('United Kingdom');
   const [newCampaignIndustry, setNewCampaignIndustry] = useState('');
@@ -1164,6 +1165,7 @@ export default function SEOAutomation() {
       id: newId,
       name,
       country,
+      senderAccountId: newCampaignSenderAccountId,
       timezone: TIMEZONE_MAP[country] || 'UTC',
       industry: newCampaignIndustry,
       decisionMakerTitle: newCampaignDecisionMaker,
@@ -2615,6 +2617,10 @@ export default function SEOAutomation() {
       toast.error('Connect your Google account first');
       return;
     }
+    if (!currentCampaign?.senderAccountId) {
+      toast.error('This campaign has no sender account set. Set one in the Schedule tab first.');
+      return;
+    }
 
     const targetRows = leads
       .filter(l => {
@@ -3137,6 +3143,14 @@ export default function SEOAutomation() {
 
   // FUNCTION 6: Schedule send for a specific time
   const scheduleSend = () => {
+    if (!currentCampaign?.senderAccountId) {
+      toast.error('This campaign has no sender account set. Set one in the Schedule tab first.');
+      return;
+    }
+    setScheduleSettings(prev => ({
+      ...prev,
+      sendDate: new Date().toISOString().split('T')[0], // refresh so a stale tab doesn't submit a past date
+    }));
     setShowScheduleModal(true);
   };
 
@@ -3485,6 +3499,11 @@ const computeBatchPreview = () => {
 
 // CONFIRM BATCH SCHEDULE
 const confirmBatchSchedule = () => {
+  if (!currentCampaign?.senderAccountId) {
+    toast.error('This campaign has no sender account set. Set one in the Schedule tab first.');
+    setShowBatchScheduleModal(false);
+    return;
+  }
   const { batches, total } = computeBatchPreview();
 
   const manualTotal = batchSplitMode === 'manual'
@@ -3588,6 +3607,10 @@ const lockBatchSchedule = async () => {
 // SEND ACTIVE BATCH
 const sendActiveBatch = async () => {
   if (!activeBatchBanner || !selectedCampaignId) return;
+  if (!currentCampaign?.senderAccountId) {
+    toast.error('This campaign has no sender account set. Set one in the Schedule tab first.');
+    return;
+  }
 
   const batchLeads = activeBatchBanner.leads;
 
@@ -3817,6 +3840,7 @@ const sendActiveBatch = async () => {
         <button
           onClick={() => {
             setNewCampaignName('');
+            setNewCampaignSenderAccountId('');
             setNewCampaignCountry('United Kingdom');
             setIsOtherCountrySelected(false);
             setNewCampaignIndustry('');
@@ -3922,6 +3946,7 @@ const sendActiveBatch = async () => {
           <button
             onClick={() => {
               setNewCampaignName('');
+              setNewCampaignSenderAccountId('');
               setNewCampaignCountry('United Kingdom');
               setIsOtherCountrySelected(false);
               setNewCampaignIndustry('');
@@ -4146,6 +4171,10 @@ const sendActiveBatch = async () => {
                     </button>
                     <button
                       onClick={() => {
+                        if (!currentCampaign?.senderAccountId) {
+                          toast.error('This campaign has no sender account set. Set one in the Schedule tab first.');
+                          return;
+                        }
                         setBatchDays(3);
                         setManualBatchSizes([0, 0, 0]);
                         setBatchTimes(['09:00', '09:00', '09:00']);
@@ -5057,16 +5086,25 @@ const sendActiveBatch = async () => {
                   Manage Accounts
                 </button>
               </div>
-              <select 
-                value={currentCampaign?.senderAccountId || ''} 
-                onChange={e => setCampaignSenderAccountId(e.target.value)}
-                style={{ width: '100%', padding: '10px 12px', borderRadius: 8, border: `1px solid ${NAVY_BORDER}`, fontSize: 12, color: NAVY, background: 'white', marginBottom: 10 }}
-              >
-                <option value="">Primary Google Account (Default)</option>
-                {connectedAccounts.map(acc => (
-                  <option key={acc.email} value={acc.email}>{acc.email}</option>
-                ))}
-              </select>
+              {sentCount > 0 ? (
+                <div style={{ padding: '10px 14px', borderRadius: 8, border: `1px solid ${NAVY_BORDER}`, background: '#F8FAFC', fontSize: 13, color: NAVY, marginBottom: 10 }}>
+                  {currentCampaign?.senderAccountId || '(none set — fix this before sending more)'}
+                  <div style={{ fontSize: 10, color: SLATE, marginTop: 4 }}>
+                    Locked — this campaign has already sent from this account. Changing it now would break follow-up threading for leads already contacted.
+                  </div>
+                </div>
+              ) : (
+                <select 
+                  value={currentCampaign?.senderAccountId || ''} 
+                  onChange={e => setCampaignSenderAccountId(e.target.value)}
+                  style={{ width: '100%', padding: '10px 12px', borderRadius: 8, border: `1px solid ${NAVY_BORDER}`, fontSize: 12, color: NAVY, background: 'white', marginBottom: 10 }}
+                >
+                  <option value="">-- Select an account (required) --</option>
+                  {connectedAccounts.map(acc => (
+                    <option key={acc.email} value={acc.email}>{acc.email}</option>
+                  ))}
+                </select>
+              )}
               <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
                 <button 
                   onClick={async () => {
@@ -5737,6 +5775,30 @@ const sendActiveBatch = async () => {
             </div>
 
             <div style={{ marginBottom: 16 }}>
+              <label style={{ fontSize: 11, fontWeight: 800, color: SLATE, display: 'block', marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+                Sender Gmail Account *
+              </label>
+              <select
+                value={newCampaignSenderAccountId || ''}
+                onChange={e => setNewCampaignSenderAccountId(e.target.value)}
+                style={{ width: '100%', padding: '10px 14px', borderRadius: 8, border: `1px solid ${NAVY_BORDER}`, fontSize: 13, boxSizing: 'border-box', background: 'white', color: NAVY }}
+              >
+                <option value="">-- Select an account (required) --</option>
+                {connectedAccounts.map(acc => (
+                  <option key={acc.email} value={acc.email}>{acc.email}</option>
+                ))}
+              </select>
+              {connectedAccounts.length === 0 && (
+                <div style={{ fontSize: 11, color: RED, marginTop: 4 }}>
+                  No Gmail accounts connected yet. Connect one from the Schedule tab first.
+                </div>
+              )}
+              <div style={{ fontSize: 10, color: SLATE, marginTop: 4 }}>
+                This account sends the initial email and every follow-up for this campaign. It can't be changed once sending starts.
+              </div>
+            </div>
+
+            <div style={{ marginBottom: 16 }}>
               <label style={{ fontSize: 11, fontWeight: 800, color: SLATE, display: 'block', marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.05em' }}>Target Country *</label>
               <select 
                 value={isOtherCountrySelected ? 'Other' : (newCampaignCountry || '')} 
@@ -5869,6 +5931,10 @@ const sendActiveBatch = async () => {
                   }
                   if (!newCampaignCountry.trim()) {
                     toast.error('Country is required');
+                    return;
+                  }
+                  if (!newCampaignSenderAccountId) {
+                    toast.error('Please select which Gmail account this campaign will send from');
                     return;
                   }
                   createCampaign(newCampaignName.trim(), newCampaignCountry.trim());

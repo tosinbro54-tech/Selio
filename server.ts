@@ -340,15 +340,19 @@ async function loadAdditionalAccounts(): Promise<Record<string, any>> {
 }
 
 async function saveAdditionalAccount(email: string, tokens: any, isPrimary = false) {
-  // Update in-memory and local fallback file
   additionalAccounts[email] = tokens;
   saveAccountsToFallbackFile();
 
   try {
+    if (isPrimary) {
+      await getSupabase()
+        .from('gmail_accounts')
+        .update({ is_primary: false })
+        .eq('user_id', 'tosin')
+        .neq('email', email);
+    }
     const { error } = await getSupabase().from('gmail_accounts').upsert({
-      email,
-      tokens,
-      user_id: 'tosin',
+      email, tokens, user_id: 'tosin',
       updated_at: new Date().toISOString(),
       is_primary: isPrimary
     }, { onConflict: 'email' });
@@ -3279,7 +3283,7 @@ app.post('/api/queue-initial-sends', async (req, res) => {
       const profile = await gmail.users.getProfile({ userId: 'me' });
       const email = profile.data.emailAddress;
       if (email) {
-        await storeAccountTokens(email, reqTokens, true);
+        await storeAccountTokens(email, reqTokens, false);
         console.log(`[QUEUE INITIAL] Captured and persisted tokens for ${email}`);
       }
     } catch (err: any) {
@@ -3404,7 +3408,7 @@ app.post('/api/queue-all-now', async (req, res) => {
       const profile = await gmail.users.getProfile({ userId: 'me' });
       const email = profile.data.emailAddress;
       if (email) {
-        await storeAccountTokens(email, reqTokens, true);
+        await storeAccountTokens(email, reqTokens, false);
         console.log(`[QUEUE ALL NOW] Captured and persisted tokens for ${email}`);
       }
     } catch (err: any) {
@@ -4233,27 +4237,20 @@ async function incrementCampaignCounter(
 }
 
 async function getPrimaryAccountEmail(): Promise<string | null> {
-  // Check in-memory fallback first
-  const keys = Object.keys(additionalAccounts);
-  if (keys.length > 0) {
-    return keys[0];
-  }
-
-  const { data, error } = await getSupabase()
+  const { data } = await getSupabase()
     .from('gmail_accounts')
     .select('email')
     .eq('is_primary', true)
     .order('updated_at', { ascending: false })
     .limit(1);
-    
-  if (error || !data || data.length === 0) {
-    const { data: fallbackData } = await getSupabase()
-      .from('gmail_accounts')
-      .select('email')
-      .limit(1);
-    return fallbackData?.[0]?.email || null;
-  }
-  return data[0].email;
+  if (data && data.length > 0) return data[0].email;
+
+  const { data: fallback } = await getSupabase()
+    .from('gmail_accounts')
+    .select('email')
+    .order('updated_at', { ascending: false })
+    .limit(1);
+  return fallback?.[0]?.email || null;
 }
 
 async function getOAuthClientByEmail(email: string) {
