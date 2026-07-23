@@ -852,7 +852,7 @@ async function retryWithExponentialBackoff<T>(fn: () => Promise<T>, maxRetries =
       
       const isQuota = status === 429 || message.includes('429') || message.includes('RESOURCE_EXHAUSTED') || message.toLowerCase().includes('quota exceeded') || message.toLowerCase().includes('exceeded your current quota');
       const isLimitZero = message.toLowerCase().includes('limit: 0') || message.toLowerCase().includes('limit:0') || message.toLowerCase().includes('limit of 0');
-      const isDailyLimit = message.toLowerCase().includes('exceeded your current quota') || message.toLowerCase().includes('limit: 20') || message.toLowerCase().includes('generaterequestsperday') || message.toLowerCase().includes('daily');
+      const isDailyLimit = message.toLowerCase().includes('limit: 20') || message.toLowerCase().includes('generaterequestsperday') || message.toLowerCase().includes('daily') || message.toLowerCase().includes('per day') || message.toLowerCase().includes('24-hour');
       
       const isRetryable = (status === 503 || message.includes('503') || message.includes('UNAVAILABLE') || (isQuota && !isLimitZero && !isDailyLimit && i < maxRetries));
       

@@ -2152,9 +2152,12 @@ export default function SEOAutomation() {
         { duration: 3000 }
       );
   
-      // Run all leads in this batch simultaneously
+      // Run all leads in this batch with staggering to avoid burst limit
       const batchResults = await Promise.allSettled(
-        batchLeads.map(async lead => {
+        batchLeads.map(async (lead, idx) => {
+          if (idx > 0) {
+            await new Promise(resolve => setTimeout(resolve, idx * 800));
+          }
           setCurrentLeadIndex(leads.indexOf(lead));
           setAnalyzingRows(prev => new Set(prev).add(lead.rowIndex));
           const res = await fetch('/api/analyze-lead', {
