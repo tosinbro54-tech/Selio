@@ -271,8 +271,7 @@ app.post('/api/auth/refresh', async (req, res) => {
     console.error('[AUTH] Token refresh failed:', err.message);
     const errStr = (err.message || '').toLowerCase();
     const isInvalidGrant = errStr.includes('invalid_grant') || 
-                          errStr.includes('bad request') || 
-                          errStr.includes('invalid client') ||
+                          errStr.includes('invalid_client') ||
                           err.response?.data?.error === 'invalid_grant';
     if (isInvalidGrant) {
       res.clearCookie('google_tokens', { secure: true, sameSite: 'none', path: '/' });
@@ -647,8 +646,7 @@ async function getOAuthClient(req: express.Request, res: express.Response, accou
       console.error(`[AUTH] Auto-refresh failed for ${accountId || 'primary'}:`, err.message);
       const errStr = (err.message || '').toLowerCase();
       const isInvalidGrant = errStr.includes('invalid_grant') || 
-                            errStr.includes('bad request') || 
-                            errStr.includes('invalid client') ||
+                            errStr.includes('invalid_client') ||
                             err.response?.data?.error === 'invalid_grant';
       if (isInvalidGrant) {
         if (isAdditional && accountId) {
@@ -4261,10 +4259,14 @@ async function getOAuthClientByEmail(email: string) {
       .from('gmail_accounts')
       .select('tokens')
       .eq('email', email)
-      .single();
+      .maybeSingle();
 
-    if (error || !data || !data.tokens) {
-      console.error(`[CRON AUTH] Failed to retrieve tokens for ${email}:`, error);
+    if (error) {
+      console.error(`[CRON AUTH] Database error retrieving tokens for ${email}:`, error.message || error);
+      return null;
+    }
+    if (!data || !data.tokens) {
+      console.warn(`[CRON AUTH] Account ${email} is not connected or tokens are missing. Skipping.`);
       return null;
     }
     tokens = data.tokens;
@@ -4295,6 +4297,14 @@ async function getOAuthClientByEmail(email: string) {
       client.setCredentials(refreshed);
     } catch (err: any) {
       console.error(`[CRON AUTH] Auto-refresh failed for ${email}:`, err.message || err);
+      const errStr = (err.message || '').toLowerCase();
+      const isInvalidGrant = errStr.includes('invalid_grant') || 
+                            errStr.includes('invalid_client') ||
+                            err.response?.data?.error === 'invalid_grant';
+      if (isInvalidGrant) {
+        console.warn(`[CRON AUTH] Detected invalid_grant for ${email}. Removing account to prevent further failure loops.`);
+        await deleteAdditionalAccount(email);
+      }
       return null;
     }
   }
@@ -4594,6 +4604,20 @@ async function processDueFollowups(campaignId?: string, forceWindow = false) {
           continue;
         }
 
+        // ATOMIC CLAIM — only one concurrent run can win this
+        const sentFlagCol = isFollowUp1 ? 'follow_up1_sent' : isFollowUp2 ? 'follow_up2_sent' : 'follow_up3_sent';
+        const { data: claimedRows, error: claimError } = await supabase
+          .from('lead_analysis')
+          .update({ [sentFlagCol]: true, updated_at: new Date().toISOString() })
+          .eq('id', a.id)
+          .eq(sentFlagCol, false)
+          .select();
+
+        if (claimError || !claimedRows || claimedRows.length === 0) {
+          console.log(`[CRON] Follow-up ${daysLabel} for ${lead.company} already claimed by another run. Skipping.`);
+          continue;
+        }
+
         const rawFollowUpBody = typeof emailBody === 'object' ? (emailBody.body || '') : String(emailBody);
         let cleanBody = rawFollowUpBody.replace(/(\bTosin\b[\s\S]*?)(\s*\bTosin\b[\s\S]*?)$/, '$1');
         
@@ -4649,19 +4673,9 @@ async function processDueFollowups(campaignId?: string, forceWindow = false) {
 
           const updates: any = {
             last_email_sent_at: new Date().toISOString(),
-            updated_at: new Date().toISOString()
+            updated_at: new Date().toISOString(),
+            [`${sentFlagCol}_at`]: new Date().toISOString()
           };
-
-          if (isFollowUp1) {
-            updates.follow_up1_sent = true;
-            updates.follow_up1_sent_at = new Date().toISOString();
-          } else if (isFollowUp2) {
-            updates.follow_up2_sent = true;
-            updates.follow_up2_sent_at = new Date().toISOString();
-          } else if (isFollowUp3) {
-            updates.follow_up3_sent = true;
-            updates.follow_up3_sent_at = new Date().toISOString();
-          }
 
           await supabase.from('lead_analysis').update(updates).eq('id', a.id);
           console.log(`[CRON] Successfully sent and saved follow-up ${daysLabel} for ${lead.company}`);
@@ -4683,6 +4697,8 @@ async function processDueFollowups(campaignId?: string, forceWindow = false) {
           }
 
         } catch (sendErr: any) {
+          // Send failed — release the claim so a future run can retry this follow-up
+          await supabase.from('lead_analysis').update({ [sentFlagCol]: false }).eq('id', a.id).catch(() => {});
           console.error(`[CRON] Failed to send follow-up ${daysLabel} to ${lead.company}:`, sendErr.message || sendErr);
           results.push({ lead: lead.company, success: false, error: sendErr.message || String(sendErr) });
         }

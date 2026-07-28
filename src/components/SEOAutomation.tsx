@@ -5083,30 +5083,42 @@ const sendActiveBatch = async () => {
             </div>
 
             <div style={{ background: 'white', border: `1px solid ${NAVY_BORDER}`, borderRadius: 16, padding: 18, marginTop: 16 }}>
+              {currentCampaign?.senderAccountId && !connectedAccounts.some(acc => acc.email === currentCampaign.senderAccountId) && (
+                <div style={{ padding: '12px 14px', background: '#FEE2E2', border: '1px solid #FCA5A5', borderRadius: 10, fontSize: 12, color: '#991B1B', fontWeight: 600, marginBottom: 14, lineHeight: 1.4 }}>
+                  ⚠️ This campaign's sender account ({currentCampaign.senderAccountId}) is disconnected. Reconnect it to resume sending.
+                </div>
+              )}
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
                 <div style={{ fontSize: 11, fontWeight: 700, color: SLATE, textTransform: 'uppercase', letterSpacing: '0.05em' }}>Campaign Sender Account</div>
                 <button onClick={() => setShowAccountManager(true)} style={{ color: BLUE, background: 'none', border: 'none', fontSize: 11, fontWeight: 700, cursor: 'pointer', padding: 0 }}>
                   Manage Accounts
                 </button>
               </div>
-              {sentCount > 0 ? (
+              {sentCount > 0 && currentCampaign?.senderAccountId ? (
                 <div style={{ padding: '10px 14px', borderRadius: 8, border: `1px solid ${NAVY_BORDER}`, background: '#F8FAFC', fontSize: 13, color: NAVY, marginBottom: 10 }}>
-                  {currentCampaign?.senderAccountId || '(none set — fix this before sending more)'}
+                  {currentCampaign?.senderAccountId}
                   <div style={{ fontSize: 10, color: SLATE, marginTop: 4 }}>
                     Locked — this campaign has already sent from this account. Changing it now would break follow-up threading for leads already contacted.
                   </div>
                 </div>
               ) : (
-                <select 
-                  value={currentCampaign?.senderAccountId || ''} 
-                  onChange={e => setCampaignSenderAccountId(e.target.value)}
-                  style={{ width: '100%', padding: '10px 12px', borderRadius: 8, border: `1px solid ${NAVY_BORDER}`, fontSize: 12, color: NAVY, background: 'white', marginBottom: 10 }}
-                >
-                  <option value="">-- Select an account (required) --</option>
-                  {connectedAccounts.map(acc => (
-                    <option key={acc.email} value={acc.email}>{acc.email}</option>
-                  ))}
-                </select>
+                <>
+                  {sentCount > 0 && !currentCampaign?.senderAccountId && (
+                    <div style={{ padding: '12px 14px', background: '#FFFBEB', border: '1px solid #FCD34D', borderRadius: 10, fontSize: 12, color: '#92400E', fontWeight: 600, marginBottom: 14, lineHeight: 1.4 }}>
+                      ⚠️ This campaign has already sent emails but has no sender account recorded. Selecting one now won't retroactively fix which account sent past emails, but will determine which account sends all future follow-ups for it. Choose the account that was actually used previously if you know it, to keep the thread ID valid — otherwise Gmail will show broken/orphaned reply threads for leads already contacted.
+                    </div>
+                  )}
+                  <select 
+                    value={currentCampaign?.senderAccountId || ''} 
+                    onChange={e => setCampaignSenderAccountId(e.target.value)}
+                    style={{ width: '100%', padding: '10px 12px', borderRadius: 8, border: `1px solid ${NAVY_BORDER}`, fontSize: 12, color: NAVY, background: 'white', marginBottom: 10 }}
+                  >
+                    <option value="">-- Select an account (required) --</option>
+                    {connectedAccounts.map(acc => (
+                      <option key={acc.email} value={acc.email}>{acc.email}</option>
+                    ))}
+                  </select>
+                </>
               )}
               <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
                 <button 
