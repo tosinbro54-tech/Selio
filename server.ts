@@ -262,6 +262,15 @@ app.post('/api/auth/refresh', async (req, res) => {
     client.setCredentials(tokens);
     const { credentials } = await client.refreshAccessToken();
     const refreshed = { ...tokens, ...credentials };
+
+    // sync the gmail_accounts row (cron's source of truth) in sync with the cookie
+    const emailForSync = tokens.email || await getPrimaryAccountEmail();
+    if (emailForSync) {
+      await storeAccountTokens(emailForSync, refreshed, true);
+    } else {
+      console.warn('[AUTH] Could not resolve email to sync refreshed primary token to DB.');
+    }
+
     res.cookie('google_tokens', JSON.stringify(refreshed), {
       httpOnly: true, secure: true, sameSite: 'none', path: '/',
       maxAge: 365 * 24 * 60 * 60 * 1000
@@ -487,6 +496,8 @@ app.get('/api/auth/callback/google', async (req, res) => {
       return res.status(400).send('Authentication failed: Could not retrieve email address from Google');
     }
     
+    mergedTokens.email = email;
+    
     if (state === 'additional') {
       await storeAccountTokens(email, mergedTokens, false);
       res.send(`
@@ -622,17 +633,11 @@ async function getOAuthClient(req: express.Request, res: express.Response, accou
       if (isAdditional && accountId) {
         await storeAccountTokens(accountId, refreshed, false);
       } else {
-        try {
-          const profileClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID, process.env.GOOGLE_CLIENT_SECRET);
-          profileClient.setCredentials(refreshed);
-          const gmail = google.gmail({ version: 'v1', auth: profileClient });
-          const profile = await gmail.users.getProfile({ userId: 'me' });
-          const email = profile.data.emailAddress;
-          if (email) {
-            await storeAccountTokens(email, refreshed, true);
-          }
-        } catch (err: any) {
-          console.warn('[AUTH] Failed to save refreshed primary token to DB:', err.message || err);
+        const emailForSync = tokens.email || await getPrimaryAccountEmail();
+        if (emailForSync) {
+          await storeAccountTokens(emailForSync, refreshed, true);
+        } else {
+          console.warn('[AUTH] Failed to resolve email to save refreshed primary token to DB.');
         }
         res.cookie('google_tokens', JSON.stringify(refreshed), {
           httpOnly: true, secure: true, sameSite: 'none', path: '/',

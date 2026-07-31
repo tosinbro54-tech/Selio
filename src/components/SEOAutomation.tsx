@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import * as XLSX from 'xlsx';
 import Papa from 'papaparse';
 import { toast } from 'react-hot-toast';
-import { getCampaigns, saveCampaign, deleteCampaign, getLastOpenedCampaign, updateCampaignLastOpened, getLeads, saveLeads, reconcileLeadDeletions, deleteCampaignLeads, getAnalysis, saveAnalysis, saveBulkAnalysis, deleteCampaignAnalysis, getReplyStatus, saveReplyStatus, deleteCampaignReplyStatus, getReputation, saveReputation, getEmailTemplates, saveEmailTemplate, deleteEmailTemplate, getBatchSchedule, saveBatchSchedule, SERVER_OWNED_DB_TO_CLIENT_FIELD } from '../lib/db';
+import { getCampaigns, saveCampaign, deleteCampaign, getLastOpenedCampaign, updateCampaignLastOpened, getLeads, saveLeads, reconcileLeadDeletions, deleteCampaignLeads, getAnalysis, saveAnalysis, saveBulkAnalysis, deleteCampaignAnalysis, getReplyStatus, saveReplyStatus, deleteCampaignReplyStatus, getReputation, saveReputation, getEmailTemplates, saveEmailTemplate, deleteEmailTemplate, getBatchSchedule, saveBatchSchedule, SERVER_OWNED_DB_TO_CLIENT_FIELD, checkCrossCampaignDuplicates, deleteLead } from '../lib/db';
 import { supabase } from '../lib/supabase';
 
 // Custom Fetch Wrapper to automatically sync refreshed Google tokens from the server
@@ -708,6 +708,11 @@ export default function SEOAutomation() {
   const [mapping, setMapping] = useState({ company: '', website: '', email: '', recipient: '' });
   const [customMappings, setCustomMappings] = useState<Array<{ sourceColumn: string; fieldName: string }>>([]);
   const [showMapper, setShowMapper] = useState(false);
+  const [reviewLeads, setReviewLeads] = useState<any[]>([]);
+  const [showLeadReview, setShowLeadReview] = useState(false);
+  const [pendingReviewLeads, setPendingReviewLeads] = useState<any[]>([]);
+  const [duplicateCheck, setDuplicateCheck] = useState<{ count: number; matchKeys: string[]; campaignNames: string[] } | null>(null);
+  const [showDuplicateModal, setShowDuplicateModal] = useState(false);
   const [analyzedLeads, setAnalyzedLeads] = useState<Record<number, any>>({});
   const [manualEmailInputs, setManualEmailInputs] = useState<Record<number, string>>({});
   const [loading, setLoading] = useState(false);
@@ -1230,6 +1235,70 @@ export default function SEOAutomation() {
           setSelectedCampaignId(nextCampaign?.id || null);
         }
         toast.success('Campaign deleted');
+      }
+    });
+  };
+
+  const handleDeleteLead = (lead: any) => {
+    setConfirmDialog({
+      isOpen: true,
+      title: '🗑️ Delete Lead',
+      message: `Delete "${lead.company || lead.website}"? Its analysis and email history will be permanently lost. This cannot be undone.`,
+      onConfirm: async () => {
+        try {
+          if (lead._supabaseId) {
+            await deleteLead(lead._supabaseId);
+          }
+          const updatedLeads = leads.filter(l => l.rowIndex !== lead.rowIndex);
+          setLeads(updatedLeads);
+          setAnalyzedLeads(prev => {
+            const next = { ...prev };
+            delete next[lead.rowIndex];
+            return next;
+          });
+          if (selectedCampaignId) {
+            localStorage.setItem(getCampaignLeadsKey(selectedCampaignId), JSON.stringify(updatedLeads));
+          } else {
+            localStorage.setItem('seo_leads', JSON.stringify(updatedLeads));
+          }
+          toast.success('Lead deleted');
+        } catch (e) {
+          console.error(e);
+          toast.error('Failed to delete lead.');
+        }
+      }
+    });
+  };
+
+  const handleDeleteSelectedLeads = () => {
+    const count = selectedLeadRows.size;
+    if (count === 0) return;
+    setConfirmDialog({
+      isOpen: true,
+      title: '🗑️ Delete Leads',
+      message: `Delete ${count} selected lead${count === 1 ? '' : 's'}? Their analysis and email history will be permanently lost. This cannot be undone.`,
+      onConfirm: async () => {
+        try {
+          const toDelete = leads.filter(l => selectedLeadRows.has(l.rowIndex));
+          await Promise.all(toDelete.filter(l => l._supabaseId).map(l => deleteLead(l._supabaseId)));
+          const updatedLeads = leads.filter(l => !selectedLeadRows.has(l.rowIndex));
+          setLeads(updatedLeads);
+          setAnalyzedLeads(prev => {
+            const next = { ...prev };
+            toDelete.forEach(l => delete next[l.rowIndex]);
+            return next;
+          });
+          setSelectedLeadRows(new Set());
+          if (selectedCampaignId) {
+            localStorage.setItem(getCampaignLeadsKey(selectedCampaignId), JSON.stringify(updatedLeads));
+          } else {
+            localStorage.setItem('seo_leads', JSON.stringify(updatedLeads));
+          }
+          toast.success(`${toDelete.length} lead${toDelete.length === 1 ? '' : 's'} deleted`);
+        } catch (e) {
+          console.error(e);
+          toast.error('Failed to delete some leads.');
+        }
       }
     });
   };
@@ -1815,44 +1884,93 @@ export default function SEOAutomation() {
         };
       }).filter(l => l.website);
 
-      // Save leads to Supabase and get back the saved leads with their _supabaseId
-      let savedLeads: any[] = [];
-      if (selectedCampaignId) {
-        try {
-          savedLeads = await saveLeads(selectedCampaignId, userId, mappedLeads);
-          await reconcileLeadDeletions(selectedCampaignId, savedLeads); // explicit, deliberate
-          setLeads(savedLeads);
-          localStorage.setItem(getCampaignLeadsKey(selectedCampaignId), JSON.stringify(savedLeads));
-        } catch (saveErr) {
-          console.error('Failed to save leads to Supabase:', saveErr);
-          toast.error('Failed to save leads. Please try again.');
-          return;
-        }
-      } else {
-        localStorage.setItem('seo_leads', JSON.stringify(mappedLeads));
-        savedLeads = mappedLeads; // no DB, use original
-        setLeads(mappedLeads);
+      if (mappedLeads.length === 0) {
+        toast.error('No valid leads found (missing website).');
+        return;
       }
-      localStorage.setItem('seo_spreadsheet_id', spreadsheetId);
-      localStorage.setItem('seo_sheet_name', sheetName);
 
       if (activeHeaders && activeHeaders.length > 0) {
         saveMapping(activeHeaders, activeMapping);
       }
+      localStorage.setItem('seo_spreadsheet_id', spreadsheetId);
+      localStorage.setItem('seo_sheet_name', sheetName);
+
+      if (selectedCampaignId && userId) {
+        try {
+          const dupCheck = await checkCrossCampaignDuplicates(userId, selectedCampaignId, mappedLeads);
+          if (dupCheck.count > 0) {
+            setDuplicateCheck(dupCheck);
+            setPendingReviewLeads(mappedLeads);
+            setShowMapper(false);
+            setShowDuplicateModal(true);
+            return;
+          }
+        } catch (dupErr) {
+          console.error('Duplicate check failed, continuing without it:', dupErr);
+        }
+      }
 
       setShowMapper(false);
-      toast.success(`Successfully mapped ${mappedLeads.length} leads!`);
-      if (mappedLeads.length > 0) {
-        toast.success(`Imported ${mappedLeads.length} leads. Starting analysis...`);
-        // Use the savedLeads which already contain _supabaseId
-        setTimeout(() => {
-          runAllAnalysis(savedLeads);
-        }, 500);
-      }
+      openLeadReview(mappedLeads);
     } catch (err: any) {
       console.error(err);
       toast.error('Error in mapping leads columns: ' + err.message);
     }
+  };
+
+  const handleDuplicateDecision = (includeThem: boolean) => {
+    let finalLeads = pendingReviewLeads;
+    if (!includeThem && duplicateCheck) {
+      const keys = new Set(duplicateCheck.matchKeys);
+      finalLeads = pendingReviewLeads.filter(l =>
+        !keys.has((l.website || '').trim().toLowerCase()) &&
+        !keys.has((l.email || '').trim().toLowerCase())
+      );
+      toast.success(`Excluded ${pendingReviewLeads.length - finalLeads.length} already-contacted lead${pendingReviewLeads.length - finalLeads.length === 1 ? '' : 's'}.`);
+    }
+    setShowDuplicateModal(false);
+    setDuplicateCheck(null);
+    setPendingReviewLeads([]);
+    openLeadReview(finalLeads);
+  };
+
+  const openLeadReview = (leads: any[]) => {
+    setReviewLeads(leads.map(l => ({ ...l, _reviewId: l.rowIndex })));
+    setShowLeadReview(true);
+  };
+
+  const removeReviewLead = (reviewId: number) => {
+    setReviewLeads(prev => prev.filter(l => l._reviewId !== reviewId));
+  };
+
+  const confirmLeadImport = async () => {
+    const leadsToSave = reviewLeads.map(({ _reviewId, ...l }) => l);
+    if (leadsToSave.length === 0) {
+      toast.error('No leads left to import.');
+      return;
+    }
+    setShowLeadReview(false);
+
+    let savedLeads: any[] = [];
+    if (selectedCampaignId) {
+      try {
+        savedLeads = await saveLeads(selectedCampaignId, userId, leadsToSave);
+        await reconcileLeadDeletions(selectedCampaignId, savedLeads);
+        setLeads(savedLeads);
+        localStorage.setItem(getCampaignLeadsKey(selectedCampaignId), JSON.stringify(savedLeads));
+      } catch (saveErr) {
+        console.error('Failed to save leads to Supabase:', saveErr);
+        toast.error('Failed to save leads. Please try again.');
+        return;
+      }
+    } else {
+      localStorage.setItem('seo_leads', JSON.stringify(leadsToSave));
+      savedLeads = leadsToSave;
+      setLeads(leadsToSave);
+    }
+
+    toast.success(`Imported ${leadsToSave.length} leads. Starting analysis...`);
+    setTimeout(() => runAllAnalysis(savedLeads), 500);
   };
 
   const fetchLeads = async () => {
@@ -4386,6 +4504,7 @@ const sendActiveBatch = async () => {
                         if (!cancelBatchRef.current) toast.success('Selected analysis complete!');
                       }} style={{ padding: '6px 12px', borderRadius: 6, fontSize: 11, background: AMBER, color: NAVY, fontWeight: 700, border: 'none', cursor: 'pointer' }}>Analyze Selected</button>
                       <button onClick={() => setSelectedLeadRows(new Set())} style={{ padding: '6px 12px', borderRadius: 6, fontSize: 11, background: '#E2E8F0', border: 'none', cursor: 'pointer', color: NAVY }}>Clear</button>
+                      <button onClick={handleDeleteSelectedLeads} style={{ padding: '6px 12px', borderRadius: 6, fontSize: 11, background: '#FEE2E2', color: RED, fontWeight: 700, border: 'none', cursor: 'pointer' }}>🗑️ Delete Selected</button>
                     </div>
                   )}
                   {leads.length > 0 && (
@@ -4604,6 +4723,7 @@ const sendActiveBatch = async () => {
                           )}
                           {analysis?.initialEmail?.body && <button onClick={e => { e.stopPropagation(); handleCreateDraft(lead); }} style={{ padding: '5px 9px', borderRadius: 6, fontSize: 10, fontWeight: 700, background: BLUE_LIGHT, color: BLUE, border: 'none', cursor: 'pointer' }}>Draft</button>}
                           {analysis && <button onClick={e => { e.stopPropagation(); setSelectedLead(lead); setActiveSection('intel'); }} style={{ padding: '5px 9px', borderRadius: 6, fontSize: 10, fontWeight: 700, background: NAVY_LIGHT, color: 'white', border: 'none', cursor: 'pointer' }}>Intel 🔍</button>}
+                          <button onClick={e => { e.stopPropagation(); handleDeleteLead(lead); }} title="Delete this lead" style={{ padding: '5px 9px', borderRadius: 6, fontSize: 10, fontWeight: 700, background: '#FEE2E2', color: RED, border: 'none', cursor: 'pointer' }}>🗑️</button>
                         </div>
                       </div>
                     );
@@ -5293,6 +5413,50 @@ const sendActiveBatch = async () => {
             <div style={{ display: 'flex', gap: 8 }}>
               <button onClick={() => setShowMapper(false)} style={{ flex: 1, padding: 12, borderRadius: 10, fontSize: 12, fontWeight: 700, background: '#F1F5F9', color: SLATE, border: 'none', cursor: 'pointer' }}>Cancel</button>
               <button onClick={() => finalizeMapping()} style={{ flex: 2, padding: 12, borderRadius: 10, fontSize: 12, fontWeight: 700, background: AMBER, color: NAVY, border: 'none', cursor: 'pointer' }}>Confirm Mapping</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* DUPLICATE MODAL */}
+      {showDuplicateModal && duplicateCheck && (
+        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 3100, padding: 16 }}>
+          <div style={{ background: 'white', borderRadius: 20, padding: 28, width: '100%', maxWidth: 440 }}>
+            <div style={{ fontSize: 18, fontWeight: 900, color: NAVY, marginBottom: 8 }}>⚠️ Leads Already Contacted</div>
+            <div style={{ fontSize: 13, color: SLATE, marginBottom: 16, lineHeight: 1.5 }}>
+              {duplicateCheck.count} lead{duplicateCheck.count === 1 ? '' : 's'} in this import already received a sent email in {duplicateCheck.campaignNames.length ? duplicateCheck.campaignNames.join(', ') : 'another campaign'}. Do you want them to be part of this campaign too?
+            </div>
+            <div style={{ display: 'flex', gap: 8 }}>
+              <button onClick={() => handleDuplicateDecision(false)} style={{ flex: 1, padding: 12, borderRadius: 10, fontSize: 12, fontWeight: 700, background: '#FEE2E2', color: RED, border: 'none', cursor: 'pointer' }}>No, exclude them</button>
+              <button onClick={() => handleDuplicateDecision(true)} style={{ flex: 1, padding: 12, borderRadius: 10, fontSize: 12, fontWeight: 700, background: AMBER, color: NAVY, border: 'none', cursor: 'pointer' }}>Yes, include them</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* LEAD REVIEW MODAL */}
+      {showLeadReview && (
+        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 3050, padding: 16 }}>
+          <div style={{ background: 'white', borderRadius: 20, padding: 28, width: '100%', maxWidth: 560, maxHeight: '85vh', display: 'flex', flexDirection: 'column' }}>
+            <div style={{ fontSize: 18, fontWeight: 900, color: NAVY, marginBottom: 4 }}>Review Leads Before Import</div>
+            <div style={{ fontSize: 12, color: SLATE, marginBottom: 16 }}>{reviewLeads.length} lead{reviewLeads.length === 1 ? '' : 's'} ready. Remove any you don't want before analysis starts.</div>
+            <div style={{ flex: 1, overflowY: 'auto', border: '1px solid #E2E8F0', borderRadius: 10 }}>
+              {reviewLeads.map(l => (
+                <div key={l._reviewId} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '10px 12px', borderBottom: '1px solid #F1F5F9' }}>
+                  <div style={{ minWidth: 0, flex: 1 }}>
+                    <div style={{ fontSize: 12, fontWeight: 700, color: NAVY, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{l.company || l.website}</div>
+                    <div style={{ fontSize: 11, color: SLATE, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{l.website}{l.email ? ` · ${l.email}` : ''}</div>
+                  </div>
+                  <button onClick={() => removeReviewLead(l._reviewId)} title="Remove this lead" style={{ background: '#FEE2E2', color: RED, border: 'none', borderRadius: 8, width: 28, height: 28, cursor: 'pointer', fontWeight: 900, flexShrink: 0, marginLeft: 8 }}>&times;</button>
+                </div>
+              ))}
+              {reviewLeads.length === 0 && (
+                <div style={{ padding: 20, textAlign: 'center', fontSize: 12, color: SLATE }}>No leads left. Cancel and re-import.</div>
+              )}
+            </div>
+            <div style={{ display: 'flex', gap: 8, marginTop: 16 }}>
+              <button onClick={() => { setShowLeadReview(false); setReviewLeads([]); }} style={{ flex: 1, padding: 12, borderRadius: 10, fontSize: 12, fontWeight: 700, background: '#F1F5F9', color: SLATE, border: 'none', cursor: 'pointer' }}>Cancel</button>
+              <button onClick={confirmLeadImport} disabled={reviewLeads.length === 0} style={{ flex: 2, padding: 12, borderRadius: 10, fontSize: 12, fontWeight: 700, background: AMBER, color: NAVY, border: 'none', cursor: reviewLeads.length === 0 ? 'not-allowed' : 'pointer', opacity: reviewLeads.length === 0 ? 0.5 : 1 }}>Import {reviewLeads.length} Lead{reviewLeads.length === 1 ? '' : 's'} & Analyze</button>
             </div>
           </div>
         </div>

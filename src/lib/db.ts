@@ -1002,3 +1002,81 @@ export const incrementQuota = async (userId: string, accountEmail: string) => {
     }, { onConflict: 'account_email,date' });
   if (error) console.error('[DB] incrementQuota error:', error);
 };
+
+// ============================================================
+// CROSS-CAMPAIGN DUPLICATE CHECK
+// ============================================================
+export const checkCrossCampaignDuplicates = async (
+  userId: string,
+  currentCampaignId: string,
+  incomingLeads: { website?: string; email?: string }[]
+) => {
+  const websites = Array.from(new Set(incomingLeads.map(l => (l.website || '').trim().toLowerCase()).filter(Boolean)));
+  const emails = Array.from(new Set(incomingLeads.map(l => (l.email || '').trim().toLowerCase()).filter(Boolean)));
+  if (!websites.length && !emails.length) return { count: 0, matchKeys: [] as string[], campaignNames: [] as string[] };
+
+  const orParts: string[] = [];
+  if (websites.length) orParts.push(`website.in.(${websites.map(w => `"${w}"`).join(',')})`);
+  if (emails.length) orParts.push(`email.in.(${emails.map(e => `"${e}"`).join(',')})`);
+
+  const { data: matchedLeads, error } = await supabase
+    .from('leads')
+    .select('id, website, email, campaign_id')
+    .eq('user_id', userId)
+    .neq('campaign_id', currentCampaignId)
+    .or(orParts.join(','));
+
+  if (error || !matchedLeads?.length) {
+    if (error) console.error('[DB] checkCrossCampaignDuplicates leads fetch error:', error);
+    return { count: 0, matchKeys: [] as string[], campaignNames: [] as string[] };
+  }
+
+  const leadIds = matchedLeads.map((l: any) => l.id);
+  const { data: sentRows, error: sentErr } = await supabase
+    .from('lead_analysis')
+    .select('lead_id, sent_status')
+    .in('lead_id', leadIds)
+    .eq('sent_status', 'sent');
+
+  if (sentErr) console.error('[DB] checkCrossCampaignDuplicates lead_analysis fetch error:', sentErr);
+
+  const sentLeadIds = new Set((sentRows || []).map((r: any) => r.lead_id));
+  const alreadySent = matchedLeads.filter((l: any) => sentLeadIds.has(l.id));
+
+  // Fetch campaign names explicitly to avoid foreign key dependency
+  const uniqueCampaignIds = Array.from(new Set(alreadySent.map((l: any) => l.campaign_id).filter(Boolean)));
+  const campaignNamesMap: Record<string, string> = {};
+  if (uniqueCampaignIds.length > 0) {
+    const { data: campaignsData, error: campaignsError } = await supabase
+      .from('campaigns')
+      .select('id, name')
+      .in('id', uniqueCampaignIds);
+    if (!campaignsError && campaignsData) {
+      campaignsData.forEach((c: any) => {
+        campaignNamesMap[c.id] = c.name;
+      });
+    }
+  }
+
+  const matchKeys = new Set<string>();
+  alreadySent.forEach((l: any) => {
+    if (l.website) matchKeys.add(String(l.website).trim().toLowerCase());
+    if (l.email) matchKeys.add(String(l.email).trim().toLowerCase());
+  });
+
+  const campaignNames = Array.from(new Set(alreadySent.map((l: any) => campaignNamesMap[l.campaign_id]).filter(Boolean)));
+
+  return { count: alreadySent.length, matchKeys: Array.from(matchKeys), campaignNames };
+};
+
+export const deleteLead = async (leadId: string) => {
+  const { error: analysisErr } = await supabase.from('lead_analysis').delete().eq('lead_id', leadId);
+  if (analysisErr) console.error('[DB] deleteLead (lead_analysis) error:', analysisErr);
+
+  const { error: replyErr } = await supabase.from('reply_status').delete().eq('lead_id', leadId);
+  if (replyErr) console.error('[DB] deleteLead (reply_status) error:', replyErr);
+
+  const { error } = await supabase.from('leads').delete().eq('id', leadId);
+  if (error) console.error('[DB] deleteLead error:', error);
+};
+
