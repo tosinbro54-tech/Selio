@@ -5203,6 +5203,11 @@ const sendActiveBatch = async () => {
             </div>
 
             <div style={{ background: 'white', border: `1px solid ${NAVY_BORDER}`, borderRadius: 16, padding: 18, marginTop: 16 }}>
+              {!currentCampaign?.senderAccountId && (
+                <div style={{ padding: '12px 14px', background: '#FEE2E2', border: '1px solid #FCA5A5', borderRadius: 10, fontSize: 12, color: RED, fontWeight: 700, marginBottom: 14 }}>
+                  ⚠️ No sender account set for this campaign — nothing will send until you pick one below.
+                </div>
+              )}
               {currentCampaign?.senderAccountId && !connectedAccounts.some(acc => acc.email === currentCampaign.senderAccountId) && (
                 <div style={{ padding: '12px 14px', background: '#FEE2E2', border: '1px solid #FCA5A5', borderRadius: 10, fontSize: 12, color: '#991B1B', fontWeight: 600, marginBottom: 14, lineHeight: 1.4 }}>
                   ⚠️ This campaign's sender account ({currentCampaign.senderAccountId}) is disconnected. Reconnect it to resume sending.

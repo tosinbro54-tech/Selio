@@ -3541,10 +3541,7 @@ app.post('/api/send-batch-now', async (req, res) => {
 
       let senderEmail = campaign.sender_account_id;
       if (!senderEmail || senderEmail === 'primary') {
-        senderEmail = await getPrimaryAccountEmail();
-      }
-      if (!senderEmail) {
-        console.error(`[SEND BATCH NOW] No sender email resolved for campaign ${campaignId}. Stopping.`);
+        console.error(`[SENDER] Campaign "${campaign.name}" (${campaign.id}) has no sender account set. Skipping — set one in campaign settings.`);
         return;
       }
 
@@ -3810,10 +3807,7 @@ async function processDueInitialEmails(campaignId?: string, forceWindow = false)
   for (const campaign of campaigns) {
     let senderEmail = campaign.sender_account_id;
     if (!senderEmail || senderEmail === 'primary') {
-      senderEmail = await getPrimaryAccountEmail();
-    }
-    
-    if (!senderEmail) {
+      console.error(`[SENDER] Campaign "${campaign.name}" (${campaign.id}) has no sender account set. Skipping — set one in campaign settings.`);
       continue;
     }
 
@@ -4424,11 +4418,7 @@ async function processDueFollowups(campaignId?: string, forceWindow = false) {
 
     let senderEmail = campaign.sender_account_id;
     if (!senderEmail || senderEmail === 'primary') {
-      senderEmail = await getPrimaryAccountEmail();
-    }
-    
-    if (!senderEmail) {
-      console.warn(`[CRON] No sender email resolved for campaign ${campaign.name}. Skipping.`);
+      console.error(`[SENDER] Campaign "${campaign.name}" (${campaign.id}) has no sender account set. Skipping — set one in campaign settings.`);
       continue;
     }
 
